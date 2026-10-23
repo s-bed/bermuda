@@ -88,6 +88,17 @@ ATTENUATION_SCHEMA = vol.All(vol.Coerce(float), _finite, vol.Range(min=0, min_in
 REF_POWER_SCHEMA = vol.All(vol.Coerce(float), _finite)
 
 
+def _validate_calibration_input(user_input: dict) -> dict[str, str]:
+    """Validate submitted numbers without exposing custom validators to the frontend."""
+    errors = {}
+    for key, schema in ((CONF_ATTENUATION, ATTENUATION_SCHEMA), (CONF_REF_POWER, REF_POWER_SCHEMA)):
+        try:
+            user_input[key] = schema(user_input[key])
+        except vol.Invalid:
+            errors[key] = f"invalid_{key}"
+    return errors
+
+
 def _attenuation_usable(value: float) -> bool:
     """An attenuation rssi_to_metres uses as it is (it replaces 0 and below)."""
     return value > 0
@@ -260,46 +271,52 @@ class BermudaOptionsFlowHandler(OptionsFlowWithConfigEntry):
 
     async def async_step_globalopts(self, user_input=None):
         """Handle global options flow."""
+        errors = {}
         if user_input is not None:
-            self.options.update(user_input)
-            return await self._update_options()
+            user_input = dict(user_input)
+            errors = _validate_calibration_input(user_input)
+            if not errors:
+                self.options.update(user_input)
+                return await self._update_options()
+
+        defaults = self.options | (user_input or {})
 
         data_schema = {
             vol.Required(
                 CONF_MAX_RADIUS,
-                default=self.options.get(CONF_MAX_RADIUS, DEFAULT_MAX_RADIUS),
+                default=defaults.get(CONF_MAX_RADIUS, DEFAULT_MAX_RADIUS),
             ): vol.Coerce(float),
             vol.Required(
                 CONF_MAX_VELOCITY,
-                default=self.options.get(CONF_MAX_VELOCITY, DEFAULT_MAX_VELOCITY),
+                default=defaults.get(CONF_MAX_VELOCITY, DEFAULT_MAX_VELOCITY),
             ): vol.Coerce(float),
             vol.Required(
                 CONF_DEVTRACK_TIMEOUT,
-                default=self.options.get(CONF_DEVTRACK_TIMEOUT, DEFAULT_DEVTRACK_TIMEOUT),
+                default=defaults.get(CONF_DEVTRACK_TIMEOUT, DEFAULT_DEVTRACK_TIMEOUT),
             ): vol.Coerce(int),
             vol.Required(
                 CONF_UPDATE_INTERVAL,
-                default=self.options.get(CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL),
+                default=defaults.get(CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL),
             ): vol.Coerce(float),
             vol.Required(
                 CONF_SMOOTHING_SAMPLES,
-                default=self.options.get(CONF_SMOOTHING_SAMPLES, DEFAULT_SMOOTHING_SAMPLES),
+                default=defaults.get(CONF_SMOOTHING_SAMPLES, DEFAULT_SMOOTHING_SAMPLES),
             ): vol.Coerce(int),
             vol.Required(
                 CONF_ATTENUATION,
-                default=_attenuation_default(self.options),
-            ): ATTENUATION_SCHEMA,
+                default=_form_default((user_input or {}).get(CONF_ATTENUATION), _attenuation_default(self.options)),
+            ): vol.Coerce(float),
             vol.Required(
                 CONF_REF_POWER,
-                default=_ref_power_default(self.options),
-            ): REF_POWER_SCHEMA,
+                default=_form_default((user_input or {}).get(CONF_REF_POWER), _ref_power_default(self.options)),
+            ): vol.Coerce(float),
             vol.Required(
                 CONF_CREATE_SCANNER_ENTITIES,
-                default=self.options.get(CONF_CREATE_SCANNER_ENTITIES, DEFAULT_CREATE_SCANNER_ENTITIES),
+                default=defaults.get(CONF_CREATE_SCANNER_ENTITIES, DEFAULT_CREATE_SCANNER_ENTITIES),
             ): bool,
         }
 
-        return self.async_show_form(step_id="globalopts", data_schema=vol.Schema(data_schema))
+        return self.async_show_form(step_id="globalopts", data_schema=vol.Schema(data_schema), errors=errors)
 
     async def async_step_selectdevices(self, user_input=None):
         """Handle a flow initialized by the user."""
@@ -435,7 +452,12 @@ class BermudaOptionsFlowHandler(OptionsFlowWithConfigEntry):
             "summary_end": "</summary>",
         }
 
+        errors = {}
         if user_input is not None:
+            user_input = dict(user_input)
+            errors = _validate_calibration_input(user_input)
+
+        if user_input is not None and not errors:
             if user_input[CONF_SAVE_AND_CLOSE]:
                 # Update the running options (this propagates to coordinator etc)
                 self.options.update(
@@ -466,6 +488,13 @@ class BermudaOptionsFlowHandler(OptionsFlowWithConfigEntry):
             self._last_device = user_input[CONF_DEVICES]
             self._last_scanner = user_input[CONF_SCANNERS]
 
+        defaults = {
+            CONF_DEVICES: self._last_device,
+            CONF_SCANNERS: self._last_scanner,
+            CONF_REF_POWER: self._last_ref_power,
+            CONF_ATTENUATION: self._last_attenuation,
+        } | (user_input or {})
+
         # TODO: Switch this to be a device selector when devices are made for scanners
         scanner_options = [
             SelectOptionDict(
@@ -477,11 +506,11 @@ class BermudaOptionsFlowHandler(OptionsFlowWithConfigEntry):
         data_schema = {
             vol.Required(
                 CONF_DEVICES,
-                default=self._last_device if self._last_device is not None else vol.UNDEFINED,
+                default=defaults[CONF_DEVICES] if defaults[CONF_DEVICES] is not None else vol.UNDEFINED,
             ): DeviceSelector(DeviceSelectorConfig(integration=DOMAIN)),
             vol.Required(
                 CONF_SCANNERS,
-                default=self._last_scanner if self._last_scanner is not None else vol.UNDEFINED,
+                default=defaults[CONF_SCANNERS] if defaults[CONF_SCANNERS] is not None else vol.UNDEFINED,
             ): SelectSelector(
                 SelectSelectorConfig(
                     options=scanner_options,
@@ -491,20 +520,19 @@ class BermudaOptionsFlowHandler(OptionsFlowWithConfigEntry):
             ),
             vol.Required(
                 CONF_REF_POWER,
-                default=self._last_ref_power if self._last_ref_power is not None else _ref_power_default(self.options),
-            ): REF_POWER_SCHEMA,
+                default=_form_default(defaults[CONF_REF_POWER], _ref_power_default(self.options)),
+            ): vol.Coerce(float),
             vol.Required(
                 CONF_ATTENUATION,
-                default=self._last_attenuation
-                if self._last_attenuation is not None
-                else _attenuation_default(self.options),
-            ): ATTENUATION_SCHEMA,
-            vol.Optional(CONF_SAVE_AND_CLOSE, default=False): vol.Coerce(bool),
+                default=_form_default(defaults[CONF_ATTENUATION], _attenuation_default(self.options)),
+            ): vol.Coerce(float),
+            vol.Optional(CONF_SAVE_AND_CLOSE, default=defaults.get(CONF_SAVE_AND_CLOSE, False)): vol.Coerce(bool),
         }
-        if user_input is None:
+        if user_input is None or errors:
             return self.async_show_form(
                 step_id="calibration1_global",
                 data_schema=vol.Schema(data_schema),
+                errors=errors,
                 description_placeholders=_ugly_token_hack
                 | {"suffix": "After you click Submit, the new distances will be shown here."},
             )
