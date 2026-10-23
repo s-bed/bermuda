@@ -3,7 +3,7 @@
     "step": {
       "user": {
         "title": "Bermuda BLE Trilateration",
-        "description": "If you need help with the configuration have a look at our [GitHub page](https://github.com/agittins/bermuda)",
+        "description": "If you need help with the configuration have a look at our GitHub page",
         "data": {
           "username": "Username",
           "password": "Password"
@@ -21,7 +21,10 @@
     "error": {
       "some_active": "You have at least some active devices, this is good.",
       "no_scanners": "You need to configure some bluetooth scanners before Bermuda will have anything to work with. \nAny one of esphome bluetooth_proxy, Shelly bluetooth proxy or local bluetooth adaptor should get you started.",
-      "no_devices": "No bluetooth devices are actively being reported from your scanners. \nYou will need to solve this before Bermuda can be of much help."
+      "no_devices": "No bluetooth devices are actively being reported from your scanners. \nYou will need to solve this before Bermuda can be of much help.",
+      "findmy_invalid": "Could not read that accessory JSON: {error_detail}",
+      "invalid_attenuation": "Enter a finite number greater than zero.",
+      "invalid_ref_power": "Enter a finite number."
     },
     "step": {
       "init": {
@@ -38,7 +41,8 @@
           "smoothing_samples": "Smoothing Samples - how many samples to use for smoothing distance readings.",
           "attenuation": "Attenuation - Environment attenuation factor for distance calculation/calibration.",
           "ref_power": "Reference Power - Default rssi at 1 metre distance, for distance calibration.",
-          "configured_devices": "Configured Devices - Select which Bluetooth devices or Beacons to track with Sensors."
+          "configured_devices": "Configured Devices - Select which Bluetooth devices or Beacons to track with Sensors.",
+          "create_scanner_entities": "Create per-scanner distance sensors"
         },
         "data_description": {
           "max_area_radius": "In the simple `AREA` feature, a device will be marked as being in the AREA of it's closest receiver, if inside this radius. If you set it small, devices will go to `unknown` between receivers, but if large devices will always appear as in their closest Area.",
@@ -47,7 +51,8 @@
           "update_interval": "Shortening distances will still trigger immediately, but increasing distances will be rate limited by this to reduce how much your database grows.",
           "smoothing_samples": "How many samples to average distance smoothing. Bigger numbers make for slower distance increases. Shortening distances are not affected. 10 or 20 seems good.",
           "attenuation": "After setting ref_power at 1 metre, adjust attenuation so that other distances read correctly - more or less.",
-          "ref_power": "Put your most-common beacon 1 metre (3.28') away from your most-common proxy / scanner. Adjust ref_power until the distance sensor shows a lowest (not average) distance of 1 metre."
+          "ref_power": "Put your most-common beacon 1 metre (3.28') away from your most-common proxy / scanner. Adjust ref_power until the distance sensor shows a lowest (not average) distance of 1 metre.",
+          "create_scanner_entities": "On by default, matching existing behaviour. Each tracked device gets one distance sensor per scanner, so this grows as devices x scanners - potentially thousands of registry entries, even while disabled. Turn off if nothing reads them, such as after switching an integration to Bermuda's direct API. This does not affect the data available to that API."
         }
       },
       "selectdevices": {
@@ -80,6 +85,35 @@
         },
         "data_description": {
           "scanner_info": "Leave at zero to accept the global default, or enter a non-zero number to offset the rssi reported by that scanner. Adjust until the estimated distance above matches the actual distance between that scanner and the selected transmitting device. Negative values will increase the distance, positive values will decrease it."
+        }
+      },
+      "findmy": {
+        "title": "FindMy Accessories",
+        "description": "Find My tags rotate their bluetooth address every 15 minutes, so they cannot be picked from the device list. Bermuda derives the addresses from each accessory's keys instead.\n{accessories}",
+        "data": {
+          "action": "Action"
+        }
+      },
+      "findmy_add": {
+        "title": "Add FindMy Accessory",
+        "description": "Paste one accessory's JSON export below. It must contain `master_key`, `skn`, `sks` and `paired_at`. Include `alignment_index` and `alignment_date` if the export has them, or Bermuda has to search a 30 day window of addresses before it locks on.\n\n**Getting the keys out of Apple** — which way works depends on your macOS:\n\n| macOS | Route |\n|---|---|\n| 14 and earlier | `python3 tools/findmy_export.py`, which reads this Mac's own records |\n| 15 and later, or no Mac | Export from iCloud with OpenTagViewer, then convert the zip with the same tool |\n\nThe full walkthrough, including what to do about AirPods and why iPhones should be added as Private BLE Devices instead, is in `docs/findmy.md` in the Bermuda repository.\n\n⚠️ **This JSON is the accessory's location secret.** Anyone who copies it can track this tag indefinitely, and it is stored unencrypted in Home Assistant backups.\n\n{error_detail}",
+        "data": {
+          "accessory_json": "Accessory JSON",
+          "name": "Name (optional, overrides the name in the JSON)"
+        }
+      },
+      "findmy_remove": {
+        "title": "Remove FindMy Accessory",
+        "description": "Select accessories to remove. This deletes their stored key material.",
+        "data": {
+          "remove": "Accessories to remove"
+        }
+      },
+      "scanners": {
+        "title": "Scanner status",
+        "description": "{scanner_table}",
+        "menu_options": {
+          "init": "Back"
         }
       }
     }

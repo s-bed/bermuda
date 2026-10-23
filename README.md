@@ -85,6 +85,101 @@ for any person/user.
 
 ![Assign a Bermuda sensor for Person tracking](img/screenshots/person-tracker.png)
 
+## Tile trackers (this fork)
+
+Tiles are recognised by their 0xFEED service advertisement (the ESPresense
+port): a Tile is named `tile_<mac>`, its reference power defaults 2 dB hotter
+than the global setting as ESPresense calibrates them (a value you set in the
+Number entity still wins), and it is listed under `Tile:` with the other
+metadevices in the device picker.
+
+Selecting a Tile configures a **Tile metadevice** (`tile_<12 hex>`) rather
+than the raw address, because newer Tiles rotate their Bluetooth address.
+Nothing in a Tile's advert can be resolved back to the tag (the schedule is
+seeded at pairing and held by Tile's servers), so the metadevice follows a
+rotation heuristically: when its bound address goes quiet and one new Tile
+address appears in the same window with the same signal strength at the same
+scanners, it re-binds. Two candidates that both fit means it binds nothing,
+logs it, and counts it in diagnostics — a wrong bind would silently report
+the wrong tag. Bindings persist across restarts. Diagnostics also carry a raw
+capture of every Tile address heard (address class, RSSI and payload history
+per scanner) for tuning the heuristic against real data.
+
+**Identity over GATT (off by default: `tile_identity_probes`).** What this
+buys depends on the Tile. On the Private ID models seen so far the readable
+ID rotates together with the address (three sweeps hours apart read three
+disjoint sets of IDs from the same tags), so it identifies a tag only until
+its next rotation, and a connection makes the Tile rotate on the spot. Leave
+it off unless your Tiles keep a stable ID. A Tile gives up its Tile ID right after connecting,
+before any authentication: through the Tile ID characteristic where a model
+has one, otherwise as a connectionless TDI request on the MEP channel (the
+`feed` service's 9d410018/9d410019 pair, the exchange
+[node-tile](https://github.com/lesleyxyz/node-tile) opens with — every Tile
+seen so far answers this one). When a proxy in active mode can reach the tag,
+Bermuda reads that ID once from the bound address and then resolves a
+rotation by reading each candidate's ID: a match binds outright, a different
+ID rules the candidate out, and a Tile that answers with no ID cannot be a
+successor because it does not rotate. A Tile changes its address right after
+every connection, so the address that appears where a just-probed one went
+silent, with the same RSSI pattern, inherits that answer instead of being
+connected to again (or the loop would never end); connections are capped at
+twenty an hour. Candidates
+are asked whether or not the Tile's own ID is known yet — a Tile whose bound
+address rotated away before its ID was ever read must not wait for a read
+that can never happen — and when the RSSI heuristic then picks a candidate
+that did answer, that answer becomes the Tile's ID, so the next rotation is
+resolved by identity. Probes run one at a time, hold the connection only for
+the read, are never attempted on an address not heard for two minutes,
+remember every answer for the life of the address, and retry an unreachable
+address after a minute (a failed read after two). The RSSI heuristic remains
+the fallback when no proxy can connect. Diagnostics list the learned IDs,
+every address's last probe answer and how long each bound address has been
+quiet.
+
+## Managing devices without the options flow (this fork)
+
+The options flow is one way to pick devices; these services (and the matching
+functions in `api.py`, which Sextant uses) are the other:
+
+- `bermuda.list_device_candidates` — everything Bermuda hears that could be
+  tracked but is not, with the `config_value` to use below (an address, or a
+  Tile metadevice id such as `TILE_24D1093B0211`).
+- `bermuda.bind_tile` — declare which Tile ID (read from the tag; see the
+  Tile identities in diagnostics or Sextant's Devices page) belongs to a
+  configured Tile. Needed once for a Tile that was added by address and lost
+  across a rotation before its ID was read; from then on every rotation is
+  resolved by identity.
+- `bermuda.track_devices` with `add` / `remove` lists.
+- `bermuda.add_findmy_accessory` (exported key JSON, optional name) and
+  `bermuda.remove_findmy_accessory` (its `findmy_` address).
+- `bermuda.set_options` for the global options (`ref_power`, `attenuation`,
+  `max_area_radius`, `max_velocity`, `devtracker_nothome_timeout`,
+  `update_interval`, `smoothing_samples`, `create_scanner_entities`,
+  `track_categories`, `exclude_devices`).
+
+Each writes the config entry exactly as the flow would, so Bermuda reloads to
+apply it. The scanner status table moved out of the options menu onto its own
+"Scanner Status" page.
+
+## Apple FindMy accessories (this fork)
+
+Merged from [Megarushing/bermuda](https://github.com/Megarushing/bermuda):
+AirTags and licensed FindMy tags rotate their address every 15 minutes on a
+key schedule seeded at pairing. Given the accessory's pairing keys, Bermuda
+derives the addresses the tag can currently be using and tracks it as a
+`findmy_<id>` metadevice, exactly like an IRK device. Configure under
+**Bermuda → Configure → FindMy Accessories**.
+
+Getting those keys out of Apple is the hard part, and which way works depends
+on your macOS version. **[docs/findmy.md](docs/findmy.md) is the walkthrough**;
+`tools/findmy_export.py` in this repo does the conversion, and on macOS 14 and
+earlier it does the extraction as well. AirPods and the Find My Siri Remote
+work the same way; iPhones and Watches are better added as Private BLE Devices.
+
+Key material lives in the config entry; alignment state lives in its own
+store so sightings never trigger a reload. Treat diagnostics and backups
+accordingly.
+
 ## FAQ
 
 See [The FAQ](https://github.com/agittins/bermuda/wiki/FAQ) in the Wiki!

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from statistics import median
 from typing import TYPE_CHECKING, Any
 
+from bluetooth_data_tools import monotonic_time_coarse
 from homeassistant.components.sensor import RestoreSensor, SensorEntity
 from homeassistant.components.sensor.const import SensorDeviceClass, SensorStateClass
 from homeassistant.const import (
@@ -17,8 +19,9 @@ from homeassistant.helpers.dispatcher import async_dispatcher_connect
 
 from .const import (
     _LOGGER,
-    ADDR_TYPE_IBEACON,
-    ADDR_TYPE_PRIVATE_BLE_DEVICE,
+    CONF_CREATE_SCANNER_ENTITIES,
+    DEFAULT_CREATE_SCANNER_ENTITIES,
+    METADEVICE_DEVICETYPES,
     SIGNAL_DEVICE_NEW,
     SIGNAL_SCANNERS_CHANGED,
 )
@@ -98,32 +101,57 @@ async def async_setup_entry(
         # go over time. So we need to maintain our matrix of which ones we have already
         # spun-up so we don't duplicate any.
 
-        for scanner in coordinator.get_scanners:
-            if (
-                scanner.is_remote_scanner is None  # usb/HCI scanner's are fine.
-                or (scanner.is_remote_scanner and scanner.address_wifi_mac is None)
-            ):
-                # This scanner doesn't have a wifi mac yet, bail out
-                # until they are all filled out.
-                return
+        # A scanner whose wifi mac hasn't resolved yet is skipped rather than
+        # blocking everyone: this used to `return` here, which meant a SINGLE
+        # such scanner anywhere in the whole system silently froze entity
+        # creation for every device against every OTHER scanner too, forever
+        # (until that one scanner resolved, which some device types - a kiosk
+        # or panel acting as a BLE scanner rather than an ESPHome/Shelly proxy
+        # - never do). Measured in production: two such scanners had frozen
+        # backfill for the entire install, capping every tracked device's
+        # registered scanners at whatever existed the moment those two
+        # appeared - worst for whichever device was tracked most recently.
+        # Safe to skip just the unresolved one: unique_id already falls back
+        # to `.address` when `address_wifi_mac` is None (see
+        # BermudaSensorScannerRange.unique_id below), so nothing here actually
+        # depended on waiting.
+        unresolved_scanners = {
+            scanner.address
+            for scanner in coordinator.get_scanners
+            if scanner.is_remote_scanner is None  # usb/HCI scanner's are fine.
+            or (scanner.is_remote_scanner and scanner.address_wifi_mac is None)
+        }
+
+        # These are the O(devices x scanners) entities: one registry row per pair,
+        # created even while disabled. On a busy install that is thousands of rows
+        # that nothing reads once a consumer has moved to the direct API
+        # (custom_components.bermuda.api.async_get_advert_snapshot), which reflects
+        # every advert in memory regardless of whether this loop ever runs. Gate
+        # their creation so that data is still available, but the registry does not
+        # grow, for anyone who has switched to the direct API.
+        create_entities = entry.options.get(CONF_CREATE_SCANNER_ENTITIES, DEFAULT_CREATE_SCANNER_ENTITIES)
 
         entities = []
         for scanner in coordinator.scanner_list:
+            if scanner in unresolved_scanners:
+                continue
             for address in created_devices:
                 if address not in created_scanners.get(scanner, []):
-                    _LOGGER.debug(
-                        "Creating Scanner %s entities for %s",
-                        scanner,
-                        address,
-                    )
-                    entities.append(BermudaSensorScannerRange(coordinator, entry, address, scanner))
-                    entities.append(BermudaSensorScannerRangeRaw(coordinator, entry, address, scanner))
                     created_entry = created_scanners.setdefault(scanner, [])
                     created_entry.append(address)
+                    if create_entities:
+                        _LOGGER.debug(
+                            "Creating Scanner %s entities for %s",
+                            scanner,
+                            address,
+                        )
+                        entities.append(BermudaSensorScannerRange(coordinator, entry, address, scanner))
+                        entities.append(BermudaSensorScannerRangeRaw(coordinator, entry, address, scanner))
         # _LOGGER.debug("Sensor received new_device signal for %s", address)
         # We set update before add to False because we are being
         # call(back(ed)) from the update, so causing it to call another would be... bad.
-        async_add_entities(entities, False)
+        if entities:
+            async_add_entities(entities, False)
 
     @callback
     def scanners_changed() -> None:
@@ -205,35 +233,45 @@ class BermudaSensor(BermudaEntity, SensorEntity):
 
     @property
     def extra_state_attributes(self) -> Mapping[str, Any] | None:
-        """Provide state_attributes for the sensor entity."""
+        """
+        Provide state_attributes for the sensor entity.
+
+        Only the Area and Floor sensors carry any. An attribute that changes
+        while the state does not still writes a recorder row, so current_mac
+        (a new one at every rotation of a random address, and on every
+        source change of a metadevice) riding on every sensor of a device
+        had the Nearest Scanner sensor rewritten every 46 s with a state
+        unchanged for four minutes. It lives on the Area sensor only; the
+        Floor sensor keeps just the floor, as the area attributes change on
+        every area switch (about half of all Floor rows were attribute-only).
+        """
+        if self.name == "Floor":
+            return {
+                "floor_id": self._device.floor_id,
+                "floor_name": self._device.floor_name,
+                "floor_level": self._device.floor_level,
+            }
+        if self.name != "Area":
+            return None
         # By default, it's the device's MAC
         current_mac = self._device.address
         # But metadevices have source_devices
-        if self._device.address_type in [
-            ADDR_TYPE_IBEACON,
-            ADDR_TYPE_PRIVATE_BLE_DEVICE,
-        ]:
+        if self._device.metadevice_type & METADEVICE_DEVICETYPES:
             # Check the current sources and find the latest
-            current_mac: str = STATE_UNAVAILABLE
+            current_mac = STATE_UNAVAILABLE
             _best_stamp = 0
             for source_ad in self._device.adverts.values():
                 if source_ad.stamp > _best_stamp:  # It's a valid ad
                     current_mac = source_ad.device_address
                     _best_stamp = source_ad.stamp
-
-        # Limit how many attributes we list - prefer new sensors instead
-        # since oft-changing attribs cause more db writes than sensors
-        # "last_seen": self.coordinator.dt_mono_to_datetime(self._device.last_seen),
-        attribs = {}
-        if self.name in ["Area", "Floor"]:
-            attribs["area_id"] = self._device.area_id
-            attribs["area_name"] = self._device.area_name
-            attribs["floor_id"] = self._device.floor_id
-            attribs["floor_name"] = self._device.floor_name
-            attribs["floor_level"] = self._device.floor_level
-        attribs["current_mac"] = current_mac
-
-        return attribs
+        return {
+            "area_id": self._device.area_id,
+            "area_name": self._device.area_name,
+            "floor_id": self._device.floor_id,
+            "floor_name": self._device.floor_name,
+            "floor_level": self._device.floor_level,
+            "current_mac": current_mac,
+        }
 
 
 class BermudaSensorFloor(BermudaSensor):
@@ -306,6 +344,40 @@ class BermudaSensorRssi(BermudaSensor):
         return SensorStateClass.MEASUREMENT
 
 
+# A device's distance is republished only when it moves by at least this
+# much from the value last published: DISTANCE_DEADBAND_M, or
+# DISTANCE_DEADBAND_FRACTION of the distance when that is larger (BLE noise
+# grows with distance). It is checked against the median of the last update
+# interval's readings, and a new value is published at most once per
+# interval: a single reading is noisier than the deadband, so with every
+# reading checked nearly every interval had one outside it, while a median
+# lets a sustained move through within about an interval of its start.
+DISTANCE_DEADBAND_M = 0.2
+DISTANCE_DEADBAND_FRACTION = 0.1
+# A drop this large (DISTANCE_FAST_FALL_M, or DISTANCE_FAST_FALL_FRACTION of
+# the distance when that is larger) is shown at once, so a device coming up
+# to a proxy is not held for the rest of the interval.
+DISTANCE_FAST_FALL_M = 1.0
+DISTANCE_FAST_FALL_FRACTION = 0.25
+# Distances are rounded to 0.1 m but held as binary floats, so a move of
+# exactly a threshold (2.0 -> 1.8 is 0.19999999999999996) must not read as
+# smaller than it.
+DISTANCE_DEADBAND_TOLERANCE = 1e-6
+# The most readings kept for the median (a 10 s interval at about one update
+# a second needs ten or eleven).
+DISTANCE_READINGS_MAX = 64
+
+
+def distance_deadband(last: float) -> float:
+    """How far a distance must move from ``last`` before it is published again."""
+    return max(DISTANCE_DEADBAND_M, DISTANCE_DEADBAND_FRACTION * abs(last))
+
+
+def distance_fast_fall(last: float) -> float:
+    """How far a distance must drop from ``last`` to be published at once."""
+    return max(DISTANCE_FAST_FALL_M, DISTANCE_FAST_FALL_FRACTION * abs(last))
+
+
 class BermudaSensorRange(BermudaSensor):
     """Extra sensor for range-to-closest-area."""
 
@@ -323,11 +395,57 @@ class BermudaSensorRange(BermudaSensor):
 
     @property
     def native_value(self):
-        """Return the native value of the sensor."""
-        distance = self._device.area_distance
-        if distance is not None:
-            return self._cached_ratelimit(round(distance, 1))
-        return None
+        """
+        Return the native value of the sensor.
+
+        The median of the readings over the last update interval is compared
+        with the distance last published, and published when it differs by
+        the deadband (see distance_deadband), at most once per interval. BLE
+        jitter is wider than the 0.1 m rounding, so without this nearly every
+        interval wrote a new recorder row for every tracked device. A large
+        drop (see distance_fast_fall) and a ref_power change (calibration)
+        show at once. A new nearest scanner starts a fresh window and is
+        published immediately, so Distance stays consistent with Area.
+        """
+        advert = self._device.area_advert
+        return self._deadbanded_distance(
+            self._device.area_distance, advert.scanner_address if advert is not None else None
+        )
+
+    def _deadbanded_distance(self, distance: float | None, scanner_address: str | None):
+        """The value to publish for ``distance`` as heard by ``scanner_address`` (see native_value)."""
+        if distance is None or scanner_address != getattr(self, "_distance_scanner_address", None):
+            # Out of range or a different receiver: the first reading must
+            # not be measured against the previous receiver's distance.
+            self.bermuda_last_state, self.bermuda_last_stamp = None, 0
+            self._distance_readings = []
+            self._distance_scanner_address = scanner_address
+        if distance is None:
+            return None
+        value = round(distance, 1)
+        nowstamp = monotonic_time_coarse()
+        last = self.bermuda_last_state
+        window_start = nowstamp - self.bermuda_update_interval
+        readings = [r for r in getattr(self, "_distance_readings", None) or () if r[0] >= window_start]
+        readings = [*readings[-(DISTANCE_READINGS_MAX - 1) :], (nowstamp, value)]
+        self._distance_readings = readings
+        if (
+            self._device.ref_power_changed >= nowstamp - 2  # calibration just changed
+            or self.bermuda_last_stamp <= 0  # nothing published yet (the cache starts at 0)
+            or not isinstance(last, int | float)
+            or last - value >= distance_fast_fall(last) - DISTANCE_DEADBAND_TOLERANCE
+        ):
+            self.bermuda_last_state, self.bermuda_last_stamp = value, nowstamp
+            self._distance_readings = []
+            return value
+        if nowstamp - self.bermuda_last_stamp <= self.bermuda_update_interval:
+            return last
+        typical = round(median(reading for _, reading in readings), 1)
+        if abs(typical - last) < distance_deadband(last) - DISTANCE_DEADBAND_TOLERANCE:
+            return last
+        self.bermuda_last_state, self.bermuda_last_stamp = typical, nowstamp
+        self._distance_readings = []
+        return typical
 
     @property
     def device_class(self):
@@ -372,16 +490,14 @@ class BermudaSensorScannerRange(BermudaSensorRange):
     @property
     def native_value(self):
         """
-        Expose distance to given scanner.
+        Expose distance to given scanner, with the same deadband as Distance.
 
-        Don't break if that scanner's never heard of us!
+        These are disabled by default, but once enabled each one used to write
+        a recorder row on every interval for every scanner that could hear the
+        device. Don't break if that scanner's never heard of us!
         """
-        distance = None
-        if (scanner := self._device.get_scanner(self._scanner.address)) is not None:
-            distance = scanner.rssi_distance
-        if distance is not None:
-            return self._cached_ratelimit(round(distance, 3))
-        return None
+        advert = self._device.get_scanner(self._scanner.address)
+        return self._deadbanded_distance(advert.rssi_distance if advert is not None else None, self._scanner.address)
 
     @property
     def extra_state_attributes(self) -> Mapping[str, Any] | None:
@@ -533,7 +649,7 @@ class BermudaActiveProxyCount(BermudaGlobalSensor):
     @property
     def native_value(self) -> int:
         """Gets the number of proxies we have access to."""
-        return self._cached_ratelimit(self.coordinator.count_active_scanners()) or 0
+        return self._cached_ratelimit(self.coordinator.count_active_scanners) or 0
 
     @property
     def name(self):
@@ -583,7 +699,7 @@ class BermudaVisibleDeviceCount(BermudaGlobalSensor):
     @property
     def native_value(self) -> int:
         """Gets the amount of devices that are active."""
-        return self._cached_ratelimit(self.coordinator.count_active_devices()) or 0
+        return self._cached_ratelimit(self.coordinator.count_active_devices) or 0
 
     @property
     def name(self):

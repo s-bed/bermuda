@@ -1,9 +1,8 @@
 """Create device_tracker entities for Bermuda devices."""
 
-from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
-from homeassistant.components.device_tracker import BaseScannerEntity
+from homeassistant.components.device_tracker import ScannerEntity
 from homeassistant.components.device_tracker.const import SourceType
 from homeassistant.const import STATE_HOME, STATE_NOT_HOME
 from homeassistant.core import HomeAssistant, callback
@@ -30,7 +29,8 @@ async def async_setup_entry(
 
     @callback
     def device_new(address: str) -> None:
-        """Create entities for newly-found device.
+        """
+        Create entities for newly-found device.
 
         Called from the data co-ordinator when it finds a new device that needs
         to have sensors created. Not called directly, but via the dispatch
@@ -59,12 +59,17 @@ async def async_setup_entry(
     # await coordinator.async_config_entry_first_refresh()
 
 
-class BermudaDeviceTracker(BermudaEntity, BaseScannerEntity):
+class BermudaDeviceTracker(BermudaEntity, ScannerEntity):
     """A trackable Bermuda Device."""
 
-    # We switched from BaseTrackerEntity to BaseScannerEntity for in_zone changes
+    # We switched from BaseTrackerEntity to a scanner entity for in_zone changes
     # and also because Tracker now seems more reliant on the lat/long
     # being present in order to report state correctly).
+    #
+    # Subclass ScannerEntity, not BaseScannerEntity: HA folded the latter into
+    # the former and removed it, which broke importing this module entirely.
+    # ScannerEntity exists either side of that change (it subclassed
+    # BaseScannerEntity before it), so this works on both.
 
     _attr_should_poll = False
     _attr_has_entity_name = True
@@ -76,11 +81,11 @@ class BermudaDeviceTracker(BermudaEntity, BaseScannerEntity):
         """Uniquely identify this sensor."""
         return self._device.unique_id
 
-    @property
-    def extra_state_attributes(self) -> Mapping[str, Any]:
-        """Return extra state attributes for this device."""
-        _scannername = self._device.area_advert.name if self._device.area_advert is not None else None
-        return {"scanner": _scannername, "area": self._device.area_name}
+    # No extra_state_attributes: the tracker used to carry the nearest
+    # scanner's name and the area, which the Nearest Scanner and Area sensors
+    # already publish. Each change of either wrote a recorder row for the
+    # tracker while its state had been "home" for half an hour: 16 of the 73
+    # Bermuda rows a minute on a 25-device install (2026-10-21).
 
     @property
     def is_connected(self):

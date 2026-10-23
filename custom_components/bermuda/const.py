@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import timedelta
 from enum import Enum
 from typing import Final
 
@@ -19,7 +20,7 @@ DOMAIN_DATA = f"{DOMAIN}_data"
 # that the component has been checked out from git, not pulled from
 # an officially built release. HACS will use the git tag (or the zip file,
 # either way it works).
-VERSION = "0.0.0"
+VERSION = "0.8.7-fork-testing.50"
 
 ATTRIBUTION = "Data provided by http://jsonplaceholder.typicode.com/"
 ISSUE_URL = "https://github.com/agittins/bermuda/issues"
@@ -79,9 +80,24 @@ METADEVICE_TYPE_IBEACON_SOURCE: Final = "beacon source"  # The source-device sen
 METADEVICE_IBEACON_DEVICE: Final = "beacon device"  # The meta-device created to track the beacon
 METADEVICE_TYPE_PRIVATE_BLE_SOURCE: Final = "private_ble_src"  # current (random) MAC of a private ble device
 METADEVICE_PRIVATE_BLE_DEVICE: Final = "private_ble_device"  # meta-device create to track private ble device
+METADEVICE_TYPE_FINDMY_SOURCE: Final = "findmy_src"  # current (rotating) MAC of a FindMy accessory
+METADEVICE_FINDMY_DEVICE: Final = "findmy_device"  # meta-device created to track a FindMy accessory
 
-METADEVICE_SOURCETYPES: Final = {METADEVICE_TYPE_IBEACON_SOURCE, METADEVICE_TYPE_PRIVATE_BLE_SOURCE}
-METADEVICE_DEVICETYPES: Final = {METADEVICE_IBEACON_DEVICE, METADEVICE_PRIVATE_BLE_DEVICE}
+METADEVICE_TYPE_TILE_SOURCE: Final = "tile_src"  # current (possibly rotating) MAC of a Tile tracker
+METADEVICE_TILE_DEVICE: Final = "tile_device"  # meta-device created to track a Tile across rotations
+
+METADEVICE_SOURCETYPES: Final = {
+    METADEVICE_TYPE_IBEACON_SOURCE,
+    METADEVICE_TYPE_PRIVATE_BLE_SOURCE,
+    METADEVICE_TYPE_FINDMY_SOURCE,
+    METADEVICE_TYPE_TILE_SOURCE,
+}
+METADEVICE_DEVICETYPES: Final = {
+    METADEVICE_IBEACON_DEVICE,
+    METADEVICE_PRIVATE_BLE_DEVICE,
+    METADEVICE_FINDMY_DEVICE,
+    METADEVICE_TILE_DEVICE,
+}
 
 # Bluetooth Device Address Type - classify MAC addresses
 BDADDR_TYPE_UNKNOWN: Final = "bd_addr_type_unknown"  # uninitialised
@@ -93,6 +109,32 @@ BDADDR_TYPE_NOT_MAC48: Final = "bd_addr_not_mac48"
 # Non-bluetooth address types - for our metadevice entries
 ADDR_TYPE_IBEACON: Final = "addr_type_ibeacon"
 ADDR_TYPE_PRIVATE_BLE_DEVICE: Final = "addr_type_private_ble_device"
+ADDR_TYPE_TILE: Final = "addr_type_tile"
+
+# --- Tile trackers ---------------------------------------------------------------
+# A Tile advertises service UUID 0xFEED, with no manufacturer data, no local
+# name and - on the hardware measured on this fork's reference install - no
+# service data either. 0xFEEC is Tile's activation service: a Tile not yet
+# claimed by an account advertises it instead (node-tile's isTileActivated is
+# "FEED and not FEEC"). Both are accepted so an unclaimed Tile still tracks.
+# The advert carries no identity at all; newer "Private ID" Tiles expose their
+# Tile ID only through a GATT characteristic (9d410007-...), which is why
+# re-binding across an address rotation is a heuristic. See bermuda_tile.py.
+TILE_SERVICE_UUID: Final = "0000feed-0000-1000-8000-00805f9b34fb"
+TILE_SERVICE_UUID_ALT: Final = "0000feec-0000-1000-8000-00805f9b34fb"
+TILE_SERVICE_UUIDS: Final = frozenset({TILE_SERVICE_UUID, TILE_SERVICE_UUID_ALT})
+TILE_METADEVICE_PREFIX: Final = "tile_"  # metadevice id: tile_<12 hex of the first configured MAC>
+# Re-binding across an address rotation (a heuristic, see bermuda_tile.py).
+TILE_SILENT_SECS: Final = 45  # bound address quiet this long -> look for a successor
+TILE_HANDOVER_WINDOW: Final = 180  # a successor must have first appeared within this of the old one going quiet
+TILE_RSSI_TOLERANCE: Final = 8.0  # dB: mean per-scanner delta a successor must be within
+TILE_RSSI_MARGIN: Final = 3.0  # dB: the best candidate must beat the runner-up by this, or nothing binds
+TILE_MIN_SCANNERS: Final = 2  # scanners that must have heard both addresses before a score counts
+TILE_SOURCE_HISTORY: Final = 8  # recent addresses kept per Tile (newest first) for diagnostics
+TILE_STORAGE_KEY: Final = f"{DOMAIN}.tile_bindings"
+TILE_STORAGE_VERSION: Final = 1
+TILE_STORAGE_SAVE_DELAY: Final = 30  # seconds
+ADDR_TYPE_FINDMY: Final = "addr_type_findmy"
 
 
 class IrkTypes(Enum):
@@ -140,6 +182,63 @@ PRUNE_TIME_UNKNOWN_IRK = 240  # Resolvable Private addresses change often, prune
 PRUNE_TIME_KNOWN_IRK: Final[int] = 16 * 60  # spec "recommends" 15 min max address age. Round up to 16 :-)
 
 PRUNE_TIME_REDACTIONS: Final[int] = 10 * 60  # when to discard redaction data
+# An advert (one device as heard by one scanner) that has timed out, holds no
+# history and has not been heard for this long is dropped. A device is kept for
+# a day (PRUNE_TIME_DEFAULT) and gathers an advert for every scanner that ever
+# heard it once, so most adverts on a big install are long silent - and every
+# one of them was still walked every update (~900k calls a minute on a
+# 60-proxy house) and tracked by the garbage collector. A new advert from that
+# scanner starts afresh, exactly as a timed-out one does.
+PRUNE_TIME_ADVERT: Final[int] = 10 * 60
+
+# FindMy accessories (AirTags and licensed third-party tags).
+#
+# The advertised key - and therefore the MAC address derived from it - rolls on a
+# fixed 15 minute schedule seeded at pairing. We can't test an address for
+# membership like an IRK, so we generate the addresses the accessory *could* be
+# using and match by lookup.
+FINDMY_KEY_INTERVAL: Final = timedelta(minutes=15)
+# The secondary key chain advances once per this many primary steps (ie, daily).
+FINDMY_SECONDARY_INTERVAL: Final[int] = 96
+# Generate a few indices beyond "now" to tolerate clock skew and early rollover.
+FINDMY_LOOKAHEAD_INDICES: Final[int] = 2
+# How long a confirmed sighting is trusted on its own, in key intervals.
+#
+# While the alignment is this fresh we believe it outright, which keeps the
+# window down to a handful of indices. Once it is older we can no longer be sure
+# it is right - it may be a stale value reloaded from storage - so the ceiling
+# also takes the pairing-derived bound, which is independent of runtime state.
+# Widening only applies to accessories we cannot currently see, which is exactly
+# when a wider net is worth paying for.
+FINDMY_ALIGNMENT_TRUST_INDICES: Final[int] = 4
+# How far below the last confirmed index to keep searching.
+#
+# The floor was pinned at exactly the aligned index, which assumes an accessory
+# never appears below where we last saw it. Observed otherwise on real hardware:
+# a tag aligned at 315 was found advertising 314, one index under the floor, and
+# was therefore invisible - the same lockout as a too-low ceiling, from the other
+# end. Key indices are monotonic in theory, but our record of them comes from
+# estimates and storage that can be wrong, so the floor needs slack. A few
+# indices cost a handful of curve operations.
+FINDMY_LOOKBEHIND_INDICES: Final[int] = 8
+# An accessory we've never confirmed a sighting for has an unbounded search window
+# (it may have been paired years ago). Cap it - a tag that is present and
+# advertising sits near the top of the range, and one sighting collapses the
+# window via alignment. 2880 indices is 30 days.
+FINDMY_MAX_UNALIGNED_INDICES: Final[int] = 2880
+# The SK chain is sequential and can be 180k+ steps long for a long-paired
+# accessory. Keep a checkpoint every N steps so we can rewind without rewalking
+# from the start, without storing the whole chain.
+FINDMY_SK_CHECKPOINT_INTERVAL: Final[int] = 1024
+# Alignment is runtime state, not configuration. It lives in its own Store rather
+# than the config entry, because updating the config entry fires the update
+# listener and reloads the whole integration - which would happen on every
+# sighting, tearing down the very metadevices we just built.
+FINDMY_STORAGE_KEY: Final = f"{DOMAIN}.findmy_alignment"
+FINDMY_STORAGE_VERSION: Final[int] = 1
+# Cooldown for alignment writes, in seconds. Sightings inside the window
+# coalesce into a single write at the end of it.
+FINDMY_STORAGE_SAVE_DELAY: Final[int] = 60
 
 SAVEOUT_COOLDOWN = 10  # seconds to delay before re-trying config entry save.
 
@@ -152,6 +251,12 @@ HIST_KEEP_COUNT = 10  # How many old timestamps, rssi, etc to keep for each devi
 
 CONFDATA_SCANNERS = "scanners"
 DOCS[CONFDATA_SCANNERS] = "Persisted set of known scanners (proxies)"
+
+CONFDATA_FINDMY = "findmy_accessories"
+DOCS[CONFDATA_FINDMY] = (
+    "FindMy accessory key material and alignment state. Contains pairing secrets -"
+    " see the FindMy section of the docs before sharing diagnostics or backups."
+)
 
 # Configuration and options
 
@@ -167,7 +272,7 @@ DOCS[CONF_MAX_RADIUS] = "For simple area-detection, max radius from receiver"
 CONF_MAX_VELOCITY, DEFAULT_MAX_VELOCITY = "max_velocity", 3
 DOCS[CONF_MAX_VELOCITY] = (
     "In metres per second - ignore readings that imply movement away faster than",
-    "this limit. 3m/s (10km/h) is good.",  # fmt: skip
+    "this limit. 3m/s (10km/h) is good.",
 )
 
 CONF_DEVTRACK_TIMEOUT, DEFAULT_DEVTRACK_TIMEOUT = "devtracker_nothome_timeout", 30
@@ -176,22 +281,39 @@ DOCS[CONF_DEVTRACK_TIMEOUT] = "Timeout in seconds for setting devices as `Not Ho
 CONF_ATTENUATION, DEFAULT_ATTENUATION = "attenuation", 3
 DOCS[CONF_ATTENUATION] = "Factor for environmental signal attenuation."
 CONF_REF_POWER, DEFAULT_REF_POWER = "ref_power", -55.0
+# ESPresense calibrates Tiles 2 dB hotter than its own default (rssi.h: TILE_TX -4
+# vs DEFAULT_TX -6), so a Tile's per-device ref_power defaults to the same offset
+# from ours. A user-set value in the Number entity still wins.
+TILE_REF_POWER: Final = DEFAULT_REF_POWER + 2.0
 DOCS[CONF_REF_POWER] = "Default RSSI for signal at 1 metre."
 
 CONF_SAVE_AND_CLOSE = "save_and_close"
 CONF_SCANNER_INFO = "scanner_info"
 CONF_RSSI_OFFSETS = "rssi_offsets"
+# Read Tile IDs over GATT (this fork). Off by default: Private ID Tiles rotate
+# the readable ID together with the address, and a connection makes the Tile
+# rotate on the spot, so probing buys nothing on them.
+CONF_TILE_PROBES = "tile_identity_probes"
 
 CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL = "update_interval", 10
 DOCS[CONF_UPDATE_INTERVAL] = (
     "Maximum time between sensor updates in seconds. Smaller intervals",
-    "means more data, bigger database.",  # fmt: skip
+    "means more data, bigger database.",
 )
 
 CONF_SMOOTHING_SAMPLES, DEFAULT_SMOOTHING_SAMPLES = "smoothing_samples", 20
 DOCS[CONF_SMOOTHING_SAMPLES] = (
     "How many samples to average distance smoothing. Bigger numbers"
     " make for slower distance increases. 10 or 20 seems good."
+)
+
+CONF_CREATE_SCANNER_ENTITIES, DEFAULT_CREATE_SCANNER_ENTITIES = "create_scanner_entities", True
+DOCS[CONF_CREATE_SCANNER_ENTITIES] = (
+    "Create a per-scanner distance sensor for every tracked device x scanner pair. "
+    "This is one entity registry entry per pair even when disabled, so it grows as "
+    "O(devices x scanners) and can reach thousands on a large install. Turn off if "
+    "nothing reads these entities - other integrations can read the same data via "
+    "Bermuda's api.async_get_advert_snapshot() without any entities existing at all."
 )
 
 # Defaults

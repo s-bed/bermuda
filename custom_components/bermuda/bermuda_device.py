@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import binascii
 import re
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Any, Final
 
 from bluetooth_data_tools import monotonic_time_coarse
 from homeassistant.components.bluetooth import (
@@ -30,12 +30,14 @@ from homeassistant.helpers import area_registry as ar
 from homeassistant.helpers import floor_registry as fr
 from homeassistant.util import slugify
 
-from .bermuda_advert import BermudaAdvert
+from .bermuda_advert import BermudaAdvert, advert_is_settled
 from .const import (
     _LOGGER,
     _LOGGER_SPAM_LESS,
+    ADDR_TYPE_FINDMY,
     ADDR_TYPE_IBEACON,
     ADDR_TYPE_PRIVATE_BLE_DEVICE,
+    ADDR_TYPE_TILE,
     BDADDR_TYPE_NOT_MAC48,
     BDADDR_TYPE_OTHER,
     BDADDR_TYPE_RANDOM_RESOLVABLE,
@@ -48,11 +50,24 @@ from .const import (
     DOMAIN,
     ICON_DEFAULT_AREA,
     ICON_DEFAULT_FLOOR,
+    METADEVICE_FINDMY_DEVICE,
     METADEVICE_IBEACON_DEVICE,
     METADEVICE_PRIVATE_BLE_DEVICE,
+    METADEVICE_TILE_DEVICE,
     METADEVICE_TYPE_IBEACON_SOURCE,
+    TILE_METADEVICE_PREFIX,
+    TILE_REF_POWER,
+    TILE_SERVICE_UUIDS,
 )
+from .device_family import identify as identify_family
 from .util import mac_math_offset, mac_norm
+from .util import mac_octet_offset as _mac_octet_offset
+
+# Integrations that provide Bluetooth scanners. When two registry entries
+# carry the same MAC - an ESPHome proxy and the router integration that also
+# tracks it as a network client - the scanner's own entry is the one from
+# one of these.
+SCANNER_DOMAINS: Final = frozenset({"bluetooth", "esphome", "shelly", "ruuvi_gateway"})
 
 if TYPE_CHECKING:
     from bleak.backends.scanner import AdvertisementData
@@ -60,7 +75,7 @@ if TYPE_CHECKING:
     from .coordinator import BermudaDataUpdateCoordinator
 
 
-class BermudaDevice(dict):
+class BermudaDevice:
     """
     This class is to represent a single bluetooth "device" tracked by Bermuda.
 
@@ -114,7 +129,7 @@ class BermudaDevice(dict):
         self.floor_id: str | None = None
         self.floor_name: str | None = None
         self.floor_icon: str = ICON_DEFAULT_FLOOR
-        self.floor_level: str | None = None
+        self.floor_level: int | None = None
 
         self.zone: str = STATE_NOT_HOME  # STATE_HOME or STATE_NOT_HOME
         self.manufacturer: str | None = None
@@ -138,6 +153,19 @@ class BermudaDevice(dict):
         self.create_button_done: bool = False
         self.create_all_done: bool = False  # All platform entities are done and ready.
         self.last_seen: float = 0  # stamp from most recent scanner spotting. monotonic_time_coarse
+        self.first_seen: float = 0  # stamp of the first advert we recorded for this address
+        self.is_tile: bool = False  # advertises Tile's 0xFEED service (see process_tile)
+        # What kind of thing this is, when the SIG lists cannot say - a Govee
+        # sensor, a SmartTag (see device_family). A label, not an identity.
+        self.device_family: str | None = None
+        self.family_rotates: bool = False
+        # calculate_data's "is this a configured device" check, cached per
+        # configured list (see there); make_name's address-based fallback,
+        # cached per (manufacturer, address) so slugify runs once, not per call.
+        self._configured_list_seen: list | None = None
+        self._is_configured: bool = False
+        self._fallback_name_key: tuple[str | None, str] | None = None
+        self._fallback_name: str | None = None
         self.diag_area_switch: str | None = None  # saves output of AreaTests
         self.adverts: dict[
             tuple[str, str], BermudaAdvert
@@ -175,7 +203,21 @@ class BermudaDevice(dict):
             if self.address.count(":") != 5:
                 # Doesn't look like an actual MAC address - should be some sort of metadevice.
 
-                if re.match("^[A-Fa-f0-9]{32}_[A-Fa-f0-9]*_[A-Fa-f0-9]*$", self.address):
+                if self.address.startswith(TILE_METADEVICE_PREFIX):
+                    # A Tile metadevice. Its sources are the tag's (possibly rotating)
+                    # addresses, bound by BermudaTileManager - see bermuda_tile.py.
+                    self.address_type = ADDR_TYPE_TILE
+                    self.metadevice_type.add(METADEVICE_TILE_DEVICE)
+                    self.beacon_unique_id = self.address
+                    self.is_tile = True
+                    if self.manufacturer is None:
+                        self.manufacturer = "Tile"
+                elif self.address.startswith("findmy_"):
+                    # A FindMy accessory metadevice. Its sources are the rotating MACs
+                    # derived from the accessory's key schedule - see bermuda_findmy.py.
+                    self.address_type = ADDR_TYPE_FINDMY
+                    self.metadevice_type.add(METADEVICE_FINDMY_DEVICE)
+                elif re.match("^[A-Fa-f0-9]{32}_[A-Fa-f0-9]*_[A-Fa-f0-9]*$", self.address):
                     # It's an iBeacon uuid_major_minor
                     self.address_type = ADDR_TYPE_IBEACON
                     self.metadevice_type.add(METADEVICE_IBEACON_DEVICE)
@@ -205,17 +247,23 @@ class BermudaDevice(dict):
                     self.address_type = BDADDR_TYPE_NOT_MAC48
             elif len(self.address) == 17:
                 top_bits = int(self.address[0:1], 16) >> 2
-                # The two MSBs of the first octet dictate the random type...
-                if top_bits & 0b00:  # First char will be in [0 1 2 3]
+                # The two MSBs of the first octet dictate the random type. These
+                # are EQUALITY tests: this used to use `&`, under which
+                # `top_bits & 0b00` is never true (non-resolvable addresses stayed
+                # UNKNOWN), `top_bits & 0b01` matched 0b11 as well (every random
+                # STATIC address was labelled resolvable and fed to the IRK
+                # resolver, which can never resolve it), and the 0b11 branch was
+                # unreachable, so BDADDR_TYPE_RANDOM_STATIC was never assigned.
+                if top_bits == 0b00:  # First char will be in [0 1 2 3]
                     self.address_type = BDADDR_TYPE_RANDOM_UNRESOLVABLE
-                elif top_bits & 0b01:  # Addresses where the first char will be 4,5,6 or 7
+                elif top_bits == 0b01:  # Addresses where the first char will be 4,5,6 or 7
                     _LOGGER.debug("Identified Resolvable Private (potential IRK source) Address on %s", self.address)
                     self.address_type = BDADDR_TYPE_RANDOM_RESOLVABLE
                     self._coordinator.irk_manager.check_mac(self.address)
-                elif top_bits & 0b10:
+                elif top_bits == 0b10:
                     self.address_type = "reserved"
                     _LOGGER.debug("Hey, got one of those reserved MACs, %s", self.address)
-                elif top_bits & 0b11:
+                else:  # 0b11, first char in [c d e f]
                     self.address_type = BDADDR_TYPE_RANDOM_STATIC
 
             else:
@@ -239,14 +287,18 @@ class BermudaDevice(dict):
         self._is_remote_scanner = False
         self._coordinator.scanner_list_del(self)
 
-    def async_as_scanner_init(self, ha_scanner: BaseHaScanner):
+    def async_as_scanner_init(self, ha_scanner: BaseHaScanner, *, force: bool = False):
         """
         Configure this device as a scanner device.
 
-        Use to set up a device as a scanner.
+        Use to set up a device as a scanner. With force, a scanner that is
+        already set up re-reads its device registry entries (area, name).
         """
         if self._hascanner is ha_scanner:
-            # Actual object has not changed, we're good.
+            # Actual object has not changed, but what the user has set on its
+            # device registry entries may have.
+            if force:
+                self.async_as_scanner_resolve_device_entries()
             return
 
         # If we don't already have a self._hascanner, then this must be our
@@ -261,10 +313,14 @@ class BermudaDevice(dict):
             self._is_remote_scanner = True
         else:
             self._is_remote_scanner = False
-        self._coordinator.scanner_list_add(self)
 
         # Find the relevant device entries in HA for this scanner and apply the names, addresses etc
+        # This must happen before scanner_list_add(), which tells the sensor platform the roster
+        # changed. The platform skips scanners whose wifi mac hasn't resolved yet, and a scanner
+        # that arrives after startup gets no other signal, so it would otherwise go without its
+        # per-scanner entities until the integration is reloaded.
         self.async_as_scanner_resolve_device_entries()
+        self._coordinator.scanner_list_add(self)
 
         # Call the per-update processor as well, but only
         # if this is our first ha_scanner.
@@ -272,6 +328,26 @@ class BermudaDevice(dict):
         # where the scanner_update might call us.
         if _first_init:
             self.async_as_scanner_update(ha_scanner)
+
+    def _from_scanner_integration(self, devreg_device) -> bool:
+        """
+        Whether a device-registry entry belongs to an integration that
+        provides Bluetooth scanners (SCANNER_DOMAINS).
+        """
+        hass = getattr(self._coordinator, "hass", None)
+        get_entry = getattr(getattr(hass, "config_entries", None), "async_get_entry", None)
+        if get_entry is None:
+            return False
+        # A device belongs to one config entry from Home Assistant 2026.10
+        # (``config_entry_id``); reading ``config_entries`` there is deprecated
+        # (removed in 2027.10), so it is only the fallback for older cores.
+        entry_id = getattr(devreg_device, "config_entry_id", None)
+        entry_ids = (entry_id,) if entry_id else getattr(devreg_device, "config_entries", None) or ()
+        for entry_id in entry_ids:
+            entry = get_entry(entry_id)
+            if getattr(entry, "domain", None) in SCANNER_DOMAINS:
+                return True
+        return False
 
     def async_as_scanner_resolve_device_entries(self):
         """From the known MAC address, resolve any relevant device entries and names etc."""
@@ -317,23 +393,66 @@ class BermudaDevice(dict):
                 connlist.add(("mac", altmac))
                 maclist.add(altmac)
 
-        # Requires 2025.3
-        devreg_devices = self._coordinator.dr.devices.get_entries(None, connections=connlist)
+        # Requires 2025.3. This used to call `dr.devices.get_entries(...)`, a
+        # lookup on the registry's internal container that HA deprecated
+        # (removal in 2027.9) in favour of the public `async_get_devices`,
+        # which is the same multi-match connection lookup. Older cores that
+        # predate the public method still get the container lookup.
+        _get_devices = getattr(self._coordinator.dr, "async_get_devices", None)
+        if _get_devices is not None:
+            devreg_devices = _get_devices(connections=connlist)
+        else:
+            devreg_devices = self._coordinator.dr.devices.get_entries(None, connections=connlist)
         devreg_count = 0  # can't len() an iterable.
         devreg_stringlist = ""  # for debug logging
+        # Rank the matches rather than letting the LAST one iterated win.
+        # The +-3 octet window is wide enough to also catch a NEIGHBOUR's
+        # registry entry: an ESPHome proxy at BLE dc:..:4a (WiFi ..:48) and an
+        # unrelated ESPHome light at WiFi ..:4c both match, and whichever the
+        # registry happened to return last became this scanner's name,
+        # unique_id and wifi mac - measured in production as a bedroom proxy
+        # reported as a basement light, so it could never be placed as the
+        # bedroom receiver it is. Prefer, in order: a device whose bluetooth
+        # connection IS this address; then the espressif rule this window
+        # exists for (BLE = WiFi + 2); then Ethernet (BLE = Ether - 1); then
+        # anything else. Registry order only breaks exact ties.
+        # Equal ranks go to the entry from an integration that provides
+        # Bluetooth scanners: a router integration (TP-Link, UniFi, Fritz)
+        # can register the same hardware under the same WiFi MAC, with its
+        # own name ("linux") and no area (#722).
+        bt_candidates: list[tuple[int, int, Any, str]] = []
+        mac_candidates: list[tuple[int, int, int, Any, str]] = []
         for devreg_device in devreg_devices:
             devreg_count += 1
             # _LOGGER.debug("DevregScanner: %s", devreg_device)
             devreg_stringlist += f"** {devreg_device.name_by_user or devreg_device.name}\n"
+            has_exact_bt = any(
+                conn[0] == "bluetooth" and conn[1].lower() == self.address for conn in devreg_device.connections
+            )
             for conn in devreg_device.connections:
                 if conn[0] == "bluetooth":
                     # Bluetooth component's device!
-                    scanner_devreg_bt = devreg_device
-                    scanner_devreg_bt_address = conn[1].lower()
+                    addr = conn[1].lower()
+                    bt_candidates.append((0 if addr == self.address else 1, devreg_count, devreg_device, addr))
                 if conn[0] == "mac":
                     # ESPHome, Shelly
-                    scanner_devreg_mac = devreg_device
-                    scanner_devreg_mac_address = conn[1]
+                    offset = _mac_octet_offset(self.address, conn[1])
+                    if has_exact_bt:
+                        rank = 0
+                    elif offset == 2:
+                        rank = 1
+                    elif offset == -1:
+                        rank = 2
+                    else:
+                        rank = 3
+                    foreign = 0 if self._from_scanner_integration(devreg_device) else 1
+                    mac_candidates.append((rank, foreign, devreg_count, devreg_device, conn[1]))
+        if bt_candidates:
+            _rank, _order, scanner_devreg_bt, scanner_devreg_bt_address = min(bt_candidates, key=lambda c: c[:2])
+        if mac_candidates:
+            _rank, _foreign, _order, scanner_devreg_mac, scanner_devreg_mac_address = min(
+                mac_candidates, key=lambda c: c[:3]
+            )
 
         if devreg_count not in (1, 2, 3):
             # We expect just the bt, or bt and another like esphome/shelly, or
@@ -361,6 +480,10 @@ class BermudaDevice(dict):
         # First clear the existing to make prioritising the bt/mac matches
         # easier (feel free to refactor, bear in mind we prefer bt first)
         _area_id = None
+        # A re-resolve (a registry change) starts from nothing: the entry_id
+        # of an earlier, wrong winner - a router's entry for the same MAC -
+        # must not survive next to the new winner's name and area.
+        self.entry_id = None
 
         _bt_name = None
         _mac_name = None
@@ -378,6 +501,14 @@ class BermudaDevice(dict):
             self.entry_id = self.entry_id or scanner_devreg_mac.id
             _mac_name = scanner_devreg_mac.name
             _mac_name_by_user = scanner_devreg_mac.name_by_user
+            if _area_id is None:
+                # Still no area: another entry for the same hardware (the
+                # same MAC) may have one - the user put the device in a room
+                # once, on whichever integration's page they found it.
+                for cand in sorted(mac_candidates, key=lambda c: c[:3]):
+                    if cand[4].lower() == str(scanner_devreg_mac_address).lower() and cand[3].area_id:
+                        _area_id = cand[3].area_id
+                        break
 
         # As of ESPHome 2025.3.0 (via aioesphomeapi 29.3.1) ESPHome proxies now
         # report their BLE MAC address instead of their WIFI MAC in the hascanner
@@ -441,7 +572,7 @@ class BermudaDevice(dict):
                 if self.floor is not None:
                     self.floor_name = self.floor.name
                     self.floor_icon = self.floor.icon or ICON_DEFAULT_FLOOR
-                    self.floor_level = self.floor_level
+                    self.floor_level = self.floor.level
                 else:
                     # floor_id was invalid
                     _LOGGER_SPAM_LESS.warning(
@@ -459,6 +590,7 @@ class BermudaDevice(dict):
                 self.floor = None
                 self.floor_name = None
                 self.floor_icon = ICON_DEFAULT_FLOOR
+                self.floor_level = None
         else:
             _LOGGER_SPAM_LESS.warning(
                 f"no_area_on_update{self.name}",
@@ -466,13 +598,17 @@ class BermudaDevice(dict):
                 self.__repr__(),
                 area_id,
             )
+            # An area that no longer exists: clear area_id too, or the device
+            # keeps reporting (and sensors keep publishing) a deleted area.
             self.area = None
+            self.area_id = None
             self.area_name = f"Invalid Area for {self.name}"
             self.area_icon = ICON_DEFAULT_AREA
             self.floor = None
             self.floor_id = None
             self.floor_name = None
             self.floor_icon = ICON_DEFAULT_FLOOR
+            self.floor_level = None
 
     def async_as_scanner_update(self, ha_scanner: BaseHaScanner):
         """
@@ -584,12 +720,15 @@ class BermudaDevice(dict):
             self.name = _newname
         elif self.address_type != BDADDR_TYPE_NOT_MAC48:
             # Couldn't find anything nice, we'll have to use the address.
-            # At least see if we can prefix it with manufacturer name
-            if self.manufacturer:
-                _prefix = f"{slugify(self.manufacturer)}"
-            else:
-                _prefix = DOMAIN
-            self.name = f"{_prefix}_{slugify(self.address)}"
+            # At least see if we can prefix it with manufacturer name. This
+            # path runs on every advert that changes a name field, for every
+            # unnamed device, so the slugs are kept until an input changes.
+            key = (self.manufacturer, self.address)
+            if key != self._fallback_name_key or self._fallback_name is None:
+                _prefix = slugify(self.manufacturer) if self.manufacturer else DOMAIN
+                self._fallback_name = f"{_prefix}_{slugify(self.address)}"
+                self._fallback_name_key = key
+            self.name = self._fallback_name
 
         return self.name
 
@@ -677,17 +816,22 @@ class BermudaDevice(dict):
         etc can be freshly smoothed and filtered.
 
         """
-        # Run calculate_data on each child scanner of this device:
+        # Run calculate_data on each child scanner of this device. Every value
+        # is a BermudaAdvert: process_advertisement is the only writer (issue
+        # #355's empty dict dates from when adverts were dict subclasses), so
+        # the isinstance check that ran ~10,000 times a cycle is gone.
+        cycle = self._coordinator.update_cycle
         for advert in self.adverts.values():
-            if isinstance(advert, BermudaAdvert):
-                # in issue #355 someone had an empty dict instead of a scanner object.
-                # it may be due to a race condition during startup, but we check now
-                # just in case. Was not able to reproduce.
-                advert.calculate_data()
-            else:
-                _LOGGER_SPAM_LESS.error(
-                    "scanner_not_instance", "Scanner device is not a BermudaDevice instance, skipping."
-                )
+            if advert_is_settled(advert) or advert.calc_cycle == cycle:
+                # Away, cleared, nothing new: calculate_data would return
+                # at its first line. Not calling it at all is most of this
+                # loop's cost - ~10,000 adverts a cycle on a 69-proxy
+                # install, 9 in 10 of them in this state (2026-10-08).
+                # Or already calculated this cycle by the other device that
+                # shares it (a metadevice and its source, see calc_cycle).
+                continue
+            advert.calc_cycle = cycle
+            advert.calculate_data()
 
         # Update whether this device has been seen recently, for device_tracker:
         if (
@@ -699,7 +843,14 @@ class BermudaDevice(dict):
         else:
             self.zone = STATE_NOT_HOME
 
-        if self.address.upper() in self.options.get(CONF_DEVICES, []):
+        # Whether we are a device the user tracks. The configured list is a
+        # plain list of upper-case addresses that only changes with a reload,
+        # so the scan is done once per list, not once per device per cycle.
+        configured = self.options.get(CONF_DEVICES, [])
+        if configured is not self._configured_list_seen:
+            self._configured_list_seen = configured
+            self._is_configured = self.address.upper() in configured
+        if self._is_configured:
             # We are a device we track. Flag for set-up:
             self.create_sensor = True
 
@@ -745,9 +896,49 @@ class BermudaDevice(dict):
         # Let's see if we should update our last_seen based on this...
         if device_advert.stamp is not None and self.last_seen < device_advert.stamp:
             self.last_seen = device_advert.stamp
+        if not self.first_seen and device_advert.stamp:
+            self.first_seen = device_advert.stamp
+
+    def process_tile(self, advert: BermudaAdvert) -> bool:
+        """
+        Identify a Tile tracker by its 0xFEED service advertisement.
+
+        The ESPresense port: on first recognition the device is marked as a
+        Tile, named as one, and its per-device ref_power set to
+        TILE_REF_POWER (2 dB hotter than the default, as ESPresense calibrates
+        Tiles) unless the user already set one. Called from the advert's
+        service-uuid handling, NOT from process_manufacturer_data: a Tile
+        carries no manufacturer data, so that hook never fires for one.
+        """
+        if not any(uuid in TILE_SERVICE_UUIDS for uuid in advert.service_uuids):
+            return False
+        if not self.is_tile:
+            self.is_tile = True
+            if self.manufacturer is None:
+                self.manufacturer = "Tile"
+            if self.ref_power == 0:  # 0 means "use the global option": respect a user override
+                self.set_ref_power(TILE_REF_POWER)
+            self.make_name()
+        return True
 
     def process_manufacturer_data(self, advert: BermudaAdvert):
         """Parse manufacturer data for maker name and iBeacon etc."""
+        # What kind of device this is, for the adverts the SIG lists cannot
+        # name. Only fills the gap: anything the lists did name keeps that.
+        if self.device_family is None:
+            family = identify_family(
+                service_uuids=advert.service_uuids,
+                service_data=advert.service_data[0] if advert.service_data else None,
+                manufacturer_data=advert.manufacturer_data[0] if advert.manufacturer_data else None,
+                name=self.name_bt_local_name or self.name,
+            )
+            if family is not None:
+                self.device_family = family.name
+                self.family_rotates = family.rotates
+                if self.manufacturer is None:
+                    self.manufacturer = family.name
+                    self.make_name()
+
         # Only override existing manufacturer name if it's "better"
 
         # ==== Check service uuids (type 0x16)
@@ -762,7 +953,11 @@ class BermudaDevice(dict):
             self.make_name()
 
         # ==== Check manfuacturer data (type 0xFF)
-        for manudict in advert.manufacturer_data:
+        # Only the newest entry: the list is newest-first history, and this
+        # runs whenever the newest entry changes. Walking the whole history
+        # re-registered an iBeacon up to HIST_KEEP_COUNT times per change and
+        # let the *oldest* entry's beacon fields win, as it was processed last.
+        for manudict in advert.manufacturer_data[:1]:
             for company_code, man_data in manudict.items():
                 name, generic = self._coordinator.get_manufacturer_from_id(company_code)
                 if name and (self.manufacturer is None or not generic):
@@ -795,6 +990,11 @@ class BermudaDevice(dict):
                         # UniversallyUniqueIDentifier is not even unique
                         # locally, so we need to make one :-)
 
+                        if len(man_data) < 22:
+                            # Too short to hold the uuid, major and minor: there is no
+                            # id to make, and registering it would create a bogus
+                            # "None_None_None" beacon metadevice.
+                            continue
                         self.beacon_unique_id = f"{self.beacon_uuid}_{self.beacon_major}_{self.beacon_minor}"
                         # Note: it's possible that a device sends multiple
                         # beacons. We are only going to process the latest
@@ -820,6 +1020,9 @@ class BermudaDevice(dict):
             if val in [self._coordinator, self.floor, self.area, self.ar, self.fr]:
                 # Objects to ignore completely.
                 continue
+            if var in ("_configured_list_seen", "_fallback_name_key"):
+                # Memo keys, not state: the list is the options' CONF_DEVICES.
+                continue
             if val in [self._hascanner, self.area, self.floor, self.ar, self.fr]:
                 if hasattr(val, "__repr__"):
                     out[var] = val.__repr__()
@@ -829,6 +1032,12 @@ class BermudaDevice(dict):
                 for advert in self.adverts.values():
                     advertout[f"{advert.device_address}__{advert.scanner_address}"] = advert.to_dict()
                 out[var] = advertout
+                continue
+            if val is self.area_advert:
+                # A BermudaAdvert, which is not JSON-serialisable. It is already
+                # dumped in full under `adverts` above, so emit just its
+                # identifying repr here to show which one won the area.
+                out[var] = val.__repr__()
                 continue
             out[var] = val
         return out

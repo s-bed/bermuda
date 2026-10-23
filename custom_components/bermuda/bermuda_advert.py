@@ -14,6 +14,7 @@ to the combination of the scanner and the device it is reporting.
 
 from __future__ import annotations
 
+from itertools import islice
 from typing import TYPE_CHECKING, Final
 
 from bluetooth_data_tools import monotonic_time_coarse
@@ -28,6 +29,7 @@ from .const import (
     DISTANCE_INFINITE,
     DISTANCE_TIMEOUT,
     HIST_KEEP_COUNT,
+    TILE_SERVICE_UUIDS,
 )
 
 # from .const import _LOGGER_SPAM_LESS
@@ -45,7 +47,20 @@ if TYPE_CHECKING:
 # ruff: noqa: PLR1730
 
 
-class BermudaAdvert(dict):
+def advert_is_settled(advert) -> bool:
+    """
+    Whether an advert is away and already cleared, with no new reading.
+
+    Every branch of BermudaAdvert.calculate_data would leave such an advert
+    exactly as it is, so it returns at once - and BermudaDevice.calculate_data
+    does not call it at all (one test, here, for both, so they cannot drift).
+    The history lists need no trim either: they only grow alongside a new
+    stamp, in update_advertisement.
+    """
+    return advert.new_stamp is None and advert.rssi_distance is None and not advert.hist_distance_by_interval
+
+
+class BermudaAdvert:
     """
     Represents details from a scanner relevant to a specific device.
 
@@ -61,6 +76,16 @@ class BermudaAdvert(dict):
     scanner that has "seen" it.
 
     """
+
+    # The coordinator update cycle this advert was last calculated in. A
+    # metadevice holds the very same advert objects as its source devices
+    # (update_metadevices copies the references), so without this the second
+    # device to reach a shared advert in a cycle ran calculate_data again:
+    # new_stamp was already consumed, so the "no new reading" branch pushed a
+    # duplicate entry into hist_distance_by_interval and hist_velocity every
+    # cycle, halving the smoothing window and the area hysteresis history for
+    # every metadevice (iBeacon, Private BLE, FindMy, Tile).
+    calc_cycle: int = -1
 
     def __hash__(self) -> int:
         """The device-mac / scanner mac uniquely identifies a received advertisement pair."""
@@ -108,14 +133,34 @@ class BermudaAdvert(dict):
         self.update_advertisement(advertisementdata, self.scanner_device)
 
     def apply_new_scanner(self, scanner_device: BermudaDevice):
-        self.name: str = scanner_device.name  # or scandata.scanner.name
         self.scanner_device = scanner_device  # links to the source device
         if self.scanner_address != scanner_device.address:
             _LOGGER.error("Advert %s received new scanner with wrong address %s", self.__repr__(), scanner_device)
-        self.area_id: str | None = scanner_device.area_id
-        self.area_name: str | None = scanner_device.area_name
         # Only remote scanners log timestamps, local usb adaptors do not.
         self.scanner_sends_stamps = scanner_device.is_remote_scanner
+
+    # The scanner's name and area are read through to the scanner device
+    # rather than copied here: a copy was refreshed only when the scanner
+    # object itself was replaced, so a proxy moved to another area (or
+    # renamed) kept its old area on every live advert - and on every
+    # metadevice sharing them - until the advert was pruned, up to ten
+    # minutes later. The area election and the Nearest Scanner sensor read
+    # these each cycle.
+
+    @property
+    def name(self) -> str:
+        """The scanner's current name."""
+        return self.scanner_device.name
+
+    @property
+    def area_id(self) -> str | None:
+        """The scanner's current area id."""
+        return self.scanner_device.area_id
+
+    @property
+    def area_name(self) -> str | None:
+        """The scanner's current area name."""
+        return self.scanner_device.area_name
 
     def update_advertisement(self, advertisementdata: AdvertisementData, scanner_device: BermudaDevice):
         """
@@ -255,6 +300,10 @@ class BermudaAdvert(dict):
                 self.service_uuids.insert(0, service_uuid)
                 _want_name_update = True
                 del self.service_uuids[HIST_KEEP_COUNT:]
+                if service_uuid in TILE_SERVICE_UUIDS:
+                    # Tiles carry no manufacturer data, so the manufacturer-data
+                    # hook above never sees them; this is where they are recognised.
+                    self._device.process_tile(self)
 
         if _want_name_update:
             self._device.make_name()
@@ -366,6 +415,17 @@ class BermudaAdvert(dict):
         packets and for temporary occlusion (dogs' bodies etc)
         """
         new_stamp = self.new_stamp  # should have been set by update()
+
+        if advert_is_settled(self):
+            # Already away and already cleared, with nothing new: every branch
+            # below would leave this advert exactly as it is. Most adverts are
+            # in this state most of the time - on a 58-scanner install 16,500
+            # adverts were walked every 1.05 s (975k calls a minute, ~3 % of
+            # the event loop), nearly all of them long silent. The history
+            # lists need no trim here either: they only grow alongside a new
+            # stamp, in update_advertisement.
+            return
+
         self.new_stamp = None  # Clear so we know if an update is missed next cycle
 
         if self.rssi_distance is None and new_stamp is not None:
@@ -410,7 +470,11 @@ class BermudaAdvert(dict):
                     peak_velocity = delta_d / delta_t
                 # if our initial reading is an approach, we are done here
                 if peak_velocity >= 0:
-                    for old_distance, old_stamp in zip(self.hist_distance[2:], self.hist_stamp[2:], strict=False):
+                    # islice avoids copying the (small, HIST_KEEP_COUNT-bounded) lists
+                    # that a [2:] slice would allocate on every call.
+                    for old_distance, old_stamp in zip(
+                        islice(self.hist_distance, 2, None), islice(self.hist_stamp, 2, None), strict=False
+                    ):
                         if old_stamp is None:
                             continue  # Skip this iteration if hist_stamp[i] is None
 
@@ -466,6 +530,17 @@ class BermudaAdvert(dict):
             # slope angle (other than increasing bucket count) might be
             # helpful, but probably dependent on use-case.
             #
+            # This rescans hist_distance_by_interval (bounded by
+            # conf_smoothing_samples, default 20) from scratch every call rather
+            # than updating a running total incrementally. That was profiled
+            # against a real, fairly dense install (61 scanners / ~5600
+            # device-scanner adverts): ~2.4ms per full update cycle, ~0.2% of the
+            # default 1.05s update interval. An incremental version is possible
+            # (a monotonic run-length stack of prefix-minimums), but it's
+            # materially more complex and this is a physical positioning
+            # calculation - not worth the correctness risk for a sub-1% saving
+            # at that scale. Revisit if conf_smoothing_samples or the
+            # device/scanner count grow much larger than that.
             dist_total: float = 0
             local_min: float = self.rssi_distance_raw or DISTANCE_INFINITE
             for distance in self.hist_distance_by_interval:
@@ -498,7 +573,7 @@ class BermudaAdvert(dict):
         # linting and typing can catch errors.
         out = {}
         for var, val in vars(self).items():
-            if val in [self.options]:
+            if val == self.options:
                 # skip certain vars that we don't want in the dump output.
                 continue
             if val in [self.options, self._device, self.scanner_device]:

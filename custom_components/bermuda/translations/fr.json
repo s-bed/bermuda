@@ -3,7 +3,7 @@
     "step": {
       "user": {
         "title": "Bermuda BLE Trilateration",
-        "description": "Si vous avez besoin d'aide pour la configuration, regardez ici: https://github.com/agittins/bermuda",
+        "description": "Si vous avez besoin d'aide pour la configuration, regardez notre page GitHub",
         "data": {
           "username": "Identifiant",
           "password": "Mot de Passe"
@@ -24,6 +24,13 @@
           "binary_sensor": "Capteur binaire activé",
           "sensor": "Capteur activé",
           "switch": "Interrupteur activé"
+        }
+      },
+      "scanners": {
+        "title": "Scanner status",
+        "description": "{scanner_table}",
+        "menu_options": {
+          "init": "Back"
         }
       }
     }

@@ -13,3 +13,123 @@ dump_devices:
       required: false
       example: "False"
       default: false
+
+track_devices:
+  name: Track devices
+  description: >-
+    Add and/or remove tracked devices without the options flow. Values are
+    addresses, or Tile metadevice ids (TILE_<12 hex>) as listed by
+    list_device_candidates. Bermuda reloads to apply the change.
+  fields:
+    add:
+      name: Add
+      description: Devices to start tracking.
+      example: '["AA:BB:CC:DD:EE:FF", "TILE_24D1093B0211"]'
+      selector:
+        object:
+    remove:
+      name: Remove
+      description: Devices to stop tracking.
+      selector:
+        object:
+
+list_device_candidates:
+  name: List device candidates
+  description: >-
+    Every device Bermuda hears that could be tracked but is not yet, with the
+    config_value to pass to track_devices.
+  fields:
+    max_age:
+      name: Max age
+      description: Skip devices not heard for this many seconds (default 7200).
+      selector:
+        number:
+          min: 60
+          max: 86400
+          unit_of_measurement: seconds
+          mode: box
+
+add_findmy_accessory:
+  name: Add FindMy accessory
+  description: Add an AirTag or licensed FindMy accessory from its exported key JSON.
+  fields:
+    accessory_json:
+      name: Accessory JSON
+      required: true
+      selector:
+        text:
+          multiline: true
+    name:
+      name: Name
+      selector:
+        text:
+
+remove_findmy_accessory:
+  name: Remove FindMy accessory
+  fields:
+    address:
+      name: Address
+      description: The accessory's metadevice address (findmy_...).
+      required: true
+      selector:
+        text:
+
+set_options:
+  name: Set global options
+  description: >-
+    Change Bermuda's global options (ref_power, attenuation, max_area_radius,
+    max_velocity, devtracker_nothome_timeout, update_interval,
+    smoothing_samples, create_scanner_entities, track_categories,
+    exclude_devices). Bermuda reloads to apply.
+  fields:
+    options:
+      name: Options
+      required: true
+      example: '{"ref_power": -55, "attenuation": 3.0}'
+      selector:
+        object:
+
+bind_tile:
+  name: Bind Tile by ID
+  description: >-
+    Declare which Tile ID (as read over Bluetooth; see the Tile identities in
+    diagnostics or Sextant's Devices page) belongs to a configured Tile. The
+    ID is remembered so every later address rotation is resolved by identity,
+    and the live address carrying it is bound at once.
+  fields:
+    tile_id:
+      name: Tile
+      required: true
+      description: The configured Tile's metadevice id (TILE_<12 hex>).
+      example: "TILE_24D1093B0211"
+      selector:
+        text:
+    tile_uid:
+      name: Tile ID
+      required: true
+      description: The 16-hex-character Tile ID read from the tag.
+      example: "c5664f0155716298"
+      selector:
+        text:
+
+bind_tile_address:
+  name: Bind Tile to an address
+  description: >-
+    Declare that a configured Tile is the tag currently advertising at this
+    address (you identified it by where it is). Its readings become the
+    Tile's remembered pattern, used to find it again after a rotation.
+  fields:
+    tile_id:
+      name: Tile
+      required: true
+      description: The configured Tile's metadevice id (TILE_<12 hex>).
+      example: "TILE_24D1093B0211"
+      selector:
+        text:
+    address:
+      name: Address
+      required: true
+      description: The Tile's current Bluetooth address, as listed among the heard devices.
+      example: "31:91:5D:22:1E:DA"
+      selector:
+        text:

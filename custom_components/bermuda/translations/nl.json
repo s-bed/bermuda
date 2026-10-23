@@ -4,7 +4,7 @@
     "step": {
       "user": {
         "title": "Bermuda BLE Trilateration",
-        "description": "Als je hulp nodig hebt met de configuratie, kijk dan op onze [GitHub pagina](https://github.com/agittins/bermuda)",
+        "description": "Als je hulp nodig hebt met de configuratie, kijk dan op onze GitHub pagina",
         "data": {
           "username": "Gebruikersnaam",
           "password": "Wachtwoord"
@@ -85,6 +85,13 @@
         },
         "data_description": {
           "scanner_info": "Laat op 0 staan om de globale waarde te gebruiken, of voer een ander getal in om de RSSI die door die scanner wordt gerapporteerd te compenseren. Pas aan totdat de geschatte afstand hierboven overeenkomt met de werkelijke afstand tussen die scanner en het geselecteerde zendapparaat. Negatieve waarden vergroten de afstand, positieve waarden verkleinen deze."
+        }
+      },
+      "scanners": {
+        "title": "Scanner status",
+        "description": "{scanner_table}",
+        "menu_options": {
+          "init": "Back"
         }
       }
     }

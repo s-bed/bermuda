@@ -18,13 +18,20 @@ from homeassistant.helpers.selector import (
     SelectSelector,
     SelectSelectorConfig,
     SelectSelectorMode,
+    TextSelector,
+    TextSelectorConfig,
 )
 
+from .bermuda_findmy import FindMyAccessoryKeys, FindMyKeyError
+from .bermuda_tile import tile_metadevice_id
 from .const import (
+    ADDR_TYPE_FINDMY,
     ADDR_TYPE_IBEACON,
     ADDR_TYPE_PRIVATE_BLE_DEVICE,
+    ADDR_TYPE_TILE,
     BDADDR_TYPE_RANDOM_RESOLVABLE,
     CONF_ATTENUATION,
+    CONF_CREATE_SCANNER_ENTITIES,
     CONF_DEVICES,
     CONF_DEVTRACK_TIMEOUT,
     CONF_MAX_RADIUS,
@@ -36,7 +43,9 @@ from .const import (
     CONF_SCANNERS,
     CONF_SMOOTHING_SAMPLES,
     CONF_UPDATE_INTERVAL,
+    CONFDATA_FINDMY,
     DEFAULT_ATTENUATION,
+    DEFAULT_CREATE_SCANNER_ENTITIES,
     DEFAULT_DEVTRACK_TIMEOUT,
     DEFAULT_MAX_RADIUS,
     DEFAULT_MAX_VELOCITY,
@@ -48,7 +57,7 @@ from .const import (
     DOMAIN_PRIVATE_BLE_DEVICE,
     NAME,
 )
-from .util import mac_redact, rssi_to_metres
+from .util import mac_redact, rssi_to_metres, usable_number
 
 if TYPE_CHECKING:
     from homeassistant.components.bluetooth import BluetoothServiceInfoBleak
@@ -61,6 +70,62 @@ if TYPE_CHECKING:
 # from homeassistant import data_entry_flow
 
 # from homeassistant.helpers.aiohttp_client import async_create_clientsession
+
+
+def _finite(value: float) -> float:
+    """Reject NaN and infinities (vol.Coerce(float) accepts "nan" and "inf")."""
+    if not usable_number(value):
+        msg = "must be a finite number"
+        raise vol.Invalid(msg)
+    return value
+
+
+# Path-loss exponent: rssi_to_metres divides by it, so zero (or NaN) aborted
+# every update cycle. Any positive finite value works; real-world ones sit
+# around 2-4. No upper bound: a value that works today must still save.
+ATTENUATION_SCHEMA = vol.All(vol.Coerce(float), _finite, vol.Range(min=0, min_included=False))
+# RSSI expected at 1 m, in dBm: any finite value.
+REF_POWER_SCHEMA = vol.All(vol.Coerce(float), _finite)
+
+
+def _validate_calibration_input(user_input: dict) -> dict[str, str]:
+    """Validate submitted numbers without exposing custom validators to the frontend."""
+    errors = {}
+    for key, schema in ((CONF_ATTENUATION, ATTENUATION_SCHEMA), (CONF_REF_POWER, REF_POWER_SCHEMA)):
+        try:
+            user_input[key] = schema(user_input[key])
+        except vol.Invalid:
+            errors[key] = f"invalid_{key}"
+    return errors
+
+
+def _attenuation_usable(value: float) -> bool:
+    """An attenuation rssi_to_metres uses as it is (it replaces 0 and below)."""
+    return value > 0
+
+
+def _form_default(value, default, usable=lambda _v: True):
+    """
+    Return a stored value as the form's default, so the form saves as shown.
+
+    The form shows exactly what the distance maths uses: the stored value when
+    rssi_to_metres takes it as it is, else the default it falls back to (an
+    attenuation of 0 or below, a NaN, a numeric string, a bool). Saving the
+    form unchanged then keeps every distance as it was.
+    """
+    if not usable_number(value) or not usable(value):
+        return default
+    return float(value)
+
+
+def _attenuation_default(options) -> float:
+    """The stored attenuation as the forms show it (see _form_default)."""
+    return _form_default(options.get(CONF_ATTENUATION, DEFAULT_ATTENUATION), DEFAULT_ATTENUATION, _attenuation_usable)
+
+
+def _ref_power_default(options) -> float:
+    """The stored ref_power as the forms show it (see _form_default)."""
+    return _form_default(options.get(CONF_REF_POWER, DEFAULT_REF_POWER), DEFAULT_REF_POWER)
 
 
 class BermudaFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
@@ -129,6 +194,8 @@ class BermudaOptionsFlowHandler(OptionsFlowWithConfigEntry):
         super().__init__(config_entry)
         self.coordinator: BermudaDataUpdateCoordinator
         self.devices: dict[str, BermudaDevice]
+        # Form validation errors, keyed as HA expects (usually "base").
+        self._errors: dict[str, str] = {}
         self._last_ref_power = None
         self._last_device = None
         self._last_scanner = None
@@ -163,10 +230,26 @@ class BermudaOptionsFlowHandler(OptionsFlowWithConfigEntry):
         else:
             messages["status"] = "You have at least some active devices, this is good."
 
-        # Build a markdown table of scanners so the user can see what's up.
-        scanner_table = "\n\nStatus of scanners:\n\n|Scanner|Address|Last advertisement|\n|---|---|---:|\n"
+        # return await self.async_step_globalopts()
+        return self.async_show_menu(
+            step_id="init",
+            menu_options={
+                "globalopts": "Global Options",
+                "selectdevices": "Select Devices",
+                "findmy": "FindMy Accessories (AirTags)",
+                "calibration1_global": "Calibration 1: Global",
+                "calibration2_scanners": "Calibration 2: Scanner RSSI Offsets",
+                "scanners": "Scanner Status",
+            },
+            description_placeholders=messages,
+        )
+
+    async def async_step_scanners(self, user_input=None):  # pylint: disable=unused-argument
+        """Show the per-scanner status table on its own page (it is long)."""
+        coordinator = self.config_entry.runtime_data.coordinator
+        scanner_table = "|Scanner|Address|Last advertisement|\n|---|---|---:|\n"
         # Use emoji to indicate if age is "good"
-        for scanner in self.coordinator.get_active_scanner_summary():
+        for scanner in coordinator.get_active_scanner_summary():
             age = int(scanner.get("last_stamp_age", 999))
             if age < 2:
                 status = '<ha-icon icon="mdi:check-circle-outline"></ha-icon>'
@@ -180,58 +263,60 @@ class BermudaOptionsFlowHandler(OptionsFlowWithConfigEntry):
                 f"| {scanner.get('name', 'NAME_ERR')}| [{shortmac}]"
                 f"| {status} {(scanner.get('last_stamp_age', DISTANCE_INFINITE)):.2f} seconds ago.|\n"
             )
-        messages["status"] += scanner_table
-
-        # return await self.async_step_globalopts()
         return self.async_show_menu(
-            step_id="init",
-            menu_options={
-                "globalopts": "Global Options",
-                "selectdevices": "Select Devices",
-                "calibration1_global": "Calibration 1: Global",
-                "calibration2_scanners": "Calibration 2: Scanner RSSI Offsets",
-            },
-            description_placeholders=messages,
+            step_id="scanners",
+            menu_options={"init": "Back"},
+            description_placeholders={"scanner_table": scanner_table},
         )
 
     async def async_step_globalopts(self, user_input=None):
         """Handle global options flow."""
+        errors = {}
         if user_input is not None:
-            self.options.update(user_input)
-            return await self._update_options()
+            user_input = dict(user_input)
+            errors = _validate_calibration_input(user_input)
+            if not errors:
+                self.options.update(user_input)
+                return await self._update_options()
+
+        defaults = self.options | (user_input or {})
 
         data_schema = {
             vol.Required(
                 CONF_MAX_RADIUS,
-                default=self.options.get(CONF_MAX_RADIUS, DEFAULT_MAX_RADIUS),
+                default=defaults.get(CONF_MAX_RADIUS, DEFAULT_MAX_RADIUS),
             ): vol.Coerce(float),
             vol.Required(
                 CONF_MAX_VELOCITY,
-                default=self.options.get(CONF_MAX_VELOCITY, DEFAULT_MAX_VELOCITY),
+                default=defaults.get(CONF_MAX_VELOCITY, DEFAULT_MAX_VELOCITY),
             ): vol.Coerce(float),
             vol.Required(
                 CONF_DEVTRACK_TIMEOUT,
-                default=self.options.get(CONF_DEVTRACK_TIMEOUT, DEFAULT_DEVTRACK_TIMEOUT),
+                default=defaults.get(CONF_DEVTRACK_TIMEOUT, DEFAULT_DEVTRACK_TIMEOUT),
             ): vol.Coerce(int),
             vol.Required(
                 CONF_UPDATE_INTERVAL,
-                default=self.options.get(CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL),
+                default=defaults.get(CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL),
             ): vol.Coerce(float),
             vol.Required(
                 CONF_SMOOTHING_SAMPLES,
-                default=self.options.get(CONF_SMOOTHING_SAMPLES, DEFAULT_SMOOTHING_SAMPLES),
+                default=defaults.get(CONF_SMOOTHING_SAMPLES, DEFAULT_SMOOTHING_SAMPLES),
             ): vol.Coerce(int),
             vol.Required(
                 CONF_ATTENUATION,
-                default=self.options.get(CONF_ATTENUATION, DEFAULT_ATTENUATION),
+                default=_form_default((user_input or {}).get(CONF_ATTENUATION), _attenuation_default(self.options)),
             ): vol.Coerce(float),
             vol.Required(
                 CONF_REF_POWER,
-                default=self.options.get(CONF_REF_POWER, DEFAULT_REF_POWER),
+                default=_form_default((user_input or {}).get(CONF_REF_POWER), _ref_power_default(self.options)),
             ): vol.Coerce(float),
+            vol.Required(
+                CONF_CREATE_SCANNER_ENTITIES,
+                default=defaults.get(CONF_CREATE_SCANNER_ENTITIES, DEFAULT_CREATE_SCANNER_ENTITIES),
+            ): bool,
         }
 
-        return self.async_show_form(step_id="globalopts", data_schema=vol.Schema(data_schema))
+        return self.async_show_form(step_id="globalopts", data_schema=vol.Schema(data_schema), errors=errors)
 
     async def async_step_selectdevices(self, user_input=None):
         """Handle a flow initialized by the user."""
@@ -240,7 +325,11 @@ class BermudaOptionsFlowHandler(OptionsFlowWithConfigEntry):
             return await self._update_options()
 
         # Grab the co-ordinator's device list so we can build a selector from it.
-        self.devices = self.config_entry.runtime_data.coordinator.devices
+        coordinator = self.config_entry.runtime_data.coordinator
+        self.devices = coordinator.devices
+        # Addresses already bound to a Tile metadevice are listed under it, not
+        # as their own raw entries.
+        tile_bound = coordinator.tile_manager.bound_sources() if hasattr(coordinator, "tile_manager") else set()
 
         # Where we store the options before building the selector
         options_list = []
@@ -259,6 +348,9 @@ class BermudaOptionsFlowHandler(OptionsFlowWithConfigEntry):
             if device.address_type == ADDR_TYPE_PRIVATE_BLE_DEVICE:
                 # Private BLE Devices get configured automagically, skip
                 continue
+            if device.address_type == ADDR_TYPE_FINDMY:
+                # FindMy accessories have their own menu, and are always tracked.
+                continue
             if device.address_type == ADDR_TYPE_IBEACON:
                 # This is an iBeacon meta-device
                 if len(device.metadevice_sources) > 0:
@@ -271,6 +363,30 @@ class BermudaOptionsFlowHandler(OptionsFlowWithConfigEntry):
                         value=device.address.upper(),
                         label=f"iBeacon: {device.address.upper()} {source_mac} "
                         f"{name if device.address.upper() != name.upper() else ''}",
+                    )
+                )
+                continue
+
+            if device.address_type == ADDR_TYPE_TILE:
+                # A Tile metadevice: tracked across address rotations.
+                source_mac = f"[{device.metadevice_sources[0].upper()}]" if device.metadevice_sources else ""
+                options_metadevices.append(
+                    SelectOptionDict(
+                        value=device.address.upper(),
+                        label=f"Tile: {device.address} {source_mac} {name if device.address != name else ''}",
+                    )
+                )
+                continue
+            if getattr(device, "is_tile", False):
+                if device.address in tile_bound:
+                    continue  # shown under its metadevice above
+                # A raw Tile address: selecting it configures a Tile METADEVICE
+                # seeded from this address, so the tag keeps being tracked when
+                # it rotates.
+                options_metadevices.append(
+                    SelectOptionDict(
+                        value=tile_metadevice_id(device.address).upper(),
+                        label=f"Tile: [{device.address.upper()}] {name}",
                     )
                 )
                 continue
@@ -336,7 +452,12 @@ class BermudaOptionsFlowHandler(OptionsFlowWithConfigEntry):
             "summary_end": "</summary>",
         }
 
+        errors = {}
         if user_input is not None:
+            user_input = dict(user_input)
+            errors = _validate_calibration_input(user_input)
+
+        if user_input is not None and not errors:
             if user_input[CONF_SAVE_AND_CLOSE]:
                 # Update the running options (this propagates to coordinator etc)
                 self.options.update(
@@ -367,6 +488,13 @@ class BermudaOptionsFlowHandler(OptionsFlowWithConfigEntry):
             self._last_device = user_input[CONF_DEVICES]
             self._last_scanner = user_input[CONF_SCANNERS]
 
+        defaults = {
+            CONF_DEVICES: self._last_device,
+            CONF_SCANNERS: self._last_scanner,
+            CONF_REF_POWER: self._last_ref_power,
+            CONF_ATTENUATION: self._last_attenuation,
+        } | (user_input or {})
+
         # TODO: Switch this to be a device selector when devices are made for scanners
         scanner_options = [
             SelectOptionDict(
@@ -378,11 +506,11 @@ class BermudaOptionsFlowHandler(OptionsFlowWithConfigEntry):
         data_schema = {
             vol.Required(
                 CONF_DEVICES,
-                default=self._last_device if self._last_device is not None else vol.UNDEFINED,
+                default=defaults[CONF_DEVICES] if defaults[CONF_DEVICES] is not None else vol.UNDEFINED,
             ): DeviceSelector(DeviceSelectorConfig(integration=DOMAIN)),
             vol.Required(
                 CONF_SCANNERS,
-                default=self._last_scanner if self._last_scanner is not None else vol.UNDEFINED,
+                default=defaults[CONF_SCANNERS] if defaults[CONF_SCANNERS] is not None else vol.UNDEFINED,
             ): SelectSelector(
                 SelectSelectorConfig(
                     options=scanner_options,
@@ -392,22 +520,19 @@ class BermudaOptionsFlowHandler(OptionsFlowWithConfigEntry):
             ),
             vol.Required(
                 CONF_REF_POWER,
-                default=self._last_ref_power
-                if self._last_ref_power is not None
-                else self.options.get(CONF_REF_POWER, DEFAULT_REF_POWER),
+                default=_form_default(defaults[CONF_REF_POWER], _ref_power_default(self.options)),
             ): vol.Coerce(float),
             vol.Required(
                 CONF_ATTENUATION,
-                default=self._last_attenuation
-                if self._last_attenuation is not None
-                else self.options.get(CONF_ATTENUATION, DEFAULT_ATTENUATION),
+                default=_form_default(defaults[CONF_ATTENUATION], _attenuation_default(self.options)),
             ): vol.Coerce(float),
-            vol.Optional(CONF_SAVE_AND_CLOSE, default=False): vol.Coerce(bool),
+            vol.Optional(CONF_SAVE_AND_CLOSE, default=defaults.get(CONF_SAVE_AND_CLOSE, False)): vol.Coerce(bool),
         }
-        if user_input is None:
+        if user_input is None or errors:
             return self.async_show_form(
                 step_id="calibration1_global",
                 data_schema=vol.Schema(data_schema),
+                errors=errors,
                 description_placeholders=_ugly_token_hack
                 | {"suffix": "After you click Submit, the new distances will be shown here."},
             )
@@ -501,7 +626,8 @@ class BermudaOptionsFlowHandler(OptionsFlowWithConfigEntry):
         saved_rssi_offsets = self.options.get(CONF_RSSI_OFFSETS, {})
         rssi_offset_dict = {}
 
-        for scanner in self.coordinator.scanner_list:
+        # Sorted by name so the list is stable and a given scanner is easy to find.
+        for scanner in self._scanner_addresses_by_name():
             scanner_name = self.coordinator.devices[scanner].name
             rssi_offset_dict[scanner_name] = saved_rssi_offsets.get(scanner, 0)
         data_schema = {
@@ -527,7 +653,7 @@ class BermudaOptionsFlowHandler(OptionsFlowWithConfigEntry):
         if device is not None and isinstance(self._last_scanner_info, dict):
             results = {}
             # Gather new estimates for distances using rssi hist and the new offset.
-            for scanner in self.coordinator.scanner_list:
+            for scanner in self._scanner_addresses_by_name():
                 scanner_name = self.coordinator.devices[scanner].name
                 cur_offset = self._last_scanner_info.get(scanner_name, 0)
                 if (scanneradvert := device.get_scanner(scanner)) is not None:
@@ -541,7 +667,11 @@ class BermudaOptionsFlowHandler(OptionsFlowWithConfigEntry):
                     ]
             # Format the results for display (HA has full markdown support!)
             results_str = "| Scanner | 0 | 1 | 2 | 3 | 4 |\n|---|---:|---:|---:|---:|---:|"
-            for scanner_name, distances in results.items():
+            # Nearest scanner (by most recent distance) first. Ties and scanners
+            # without any history keep their by-name order.
+            for scanner_name, distances in sorted(
+                results.items(), key=lambda item: item[1][0] if item[1] else DISTANCE_INFINITE
+            ):
                 results_str += f"\n|{scanner_name}|"
                 for i in range(5):
                     # We round to 2 places (1cm) and pad to fit nn.nn
@@ -555,6 +685,13 @@ class BermudaOptionsFlowHandler(OptionsFlowWithConfigEntry):
             step_id="calibration2_scanners",
             data_schema=vol.Schema(data_schema),
             description_placeholders={"suffix": results_str},
+        )
+
+    def _scanner_addresses_by_name(self) -> list[str]:
+        """Return the scanner addresses, sorted (case-insensitively) by scanner name."""
+        return sorted(
+            self.coordinator.scanner_list,
+            key=lambda address: str(self.coordinator.devices[address].name).casefold(),
         )
 
     def _get_bermuda_device_from_registry(self, registry_id: str) -> BermudaDevice | None:
@@ -579,6 +716,148 @@ class BermudaOptionsFlowHandler(OptionsFlowWithConfigEntry):
                 return self.coordinator.devices[device_address.lower()]
         # We couldn't match the HA device id to a bermuda device mac.
         return None
+
+    async def async_step_findmy(self, user_input=None):
+        """
+        Manage FindMy accessories (AirTags and licensed third-party tags).
+
+        These can't be picked from the discovered-devices list: they rotate their
+        MAC every 15 minutes, so there is no stable address to select. Instead the
+        user supplies the accessory's key material, and we derive the addresses.
+        """
+        coordinator = self.config_entry.runtime_data.coordinator
+        accessories = coordinator.findmy_manager.accessories
+
+        if user_input is not None:
+            if user_input.get("action") == "add":
+                return await self.async_step_findmy_add()
+            if user_input.get("action") == "remove":
+                return await self.async_step_findmy_remove()
+            return await self.async_step_init()
+
+        if accessories:
+            table = "\n\n| Accessory | Model | Key index | Status |\n|---|---|---:|---|\n"
+            for acc in accessories.values():
+                metadevice = coordinator.devices.get(acc.address)
+                if metadevice is not None and metadevice.metadevice_sources:
+                    status = f"Seen as {metadevice.metadevice_sources[0].upper()}"
+                elif acc.alignment_index:
+                    status = "Aligned, not currently visible"
+                else:
+                    status = "Never seen - searching"
+                table += f"| {acc.friendly_name} | {acc.model or '-'} | {acc.alignment_index} | {status} |\n"
+        else:
+            table = "\n\nNo accessories configured yet."
+
+        menu_options = {"add": "Add an accessory"}
+        if accessories:
+            menu_options["remove"] = "Remove an accessory"
+        menu_options["back"] = "Back"
+
+        return self.async_show_form(
+            step_id="findmy",
+            data_schema=vol.Schema(
+                {
+                    vol.Required("action", default="add"): SelectSelector(
+                        SelectSelectorConfig(
+                            options=[SelectOptionDict(value=k, label=v) for k, v in menu_options.items()],
+                            mode=SelectSelectorMode.LIST,
+                        )
+                    )
+                }
+            ),
+            description_placeholders={"accessories": table},
+            errors=self._errors,
+        )
+
+    async def async_step_findmy_add(self, user_input=None):
+        """Add a FindMy accessory by pasting its exported key JSON."""
+        self._errors = {}
+
+        if user_input is not None:
+            coordinator = self.config_entry.runtime_data.coordinator
+            try:
+                accessory = FindMyAccessoryKeys.from_json(user_input["accessory_json"])
+            except FindMyKeyError as err:
+                self._errors["base"] = "findmy_invalid"
+                return self.async_show_form(
+                    step_id="findmy_add",
+                    data_schema=self._findmy_add_schema(user_input),
+                    errors=self._errors,
+                    description_placeholders={"error_detail": str(err)},
+                )
+
+            name = (user_input.get("name") or "").strip()
+            if name:
+                accessory.name = name
+
+            coordinator.findmy_manager.add_accessory(accessory)
+            # Persist immediately - the user should not lose this if HA restarts
+            # before the next update cycle.
+            self.hass.config_entries.async_update_entry(
+                self.config_entry,
+                data={**self.config_entry.data, CONFDATA_FINDMY: coordinator.findmy_manager.dump()},
+            )
+            return await self.async_step_findmy()
+
+        return self.async_show_form(
+            step_id="findmy_add",
+            data_schema=self._findmy_add_schema(),
+            errors=self._errors,
+            description_placeholders={"error_detail": ""},
+        )
+
+    @staticmethod
+    def _findmy_add_schema(user_input=None):
+        """Schema for the paste-JSON form, preserving input across a failed validation."""
+        user_input = user_input or {}
+        return vol.Schema(
+            {
+                vol.Required("accessory_json", default=user_input.get("accessory_json", "")): TextSelector(
+                    TextSelectorConfig(multiline=True)
+                ),
+                vol.Optional("name", default=user_input.get("name", "")): str,
+            }
+        )
+
+    async def async_step_findmy_remove(self, user_input=None):
+        """Remove a configured FindMy accessory."""
+        coordinator = self.config_entry.runtime_data.coordinator
+        accessories = coordinator.findmy_manager.accessories
+
+        if user_input is not None:
+            removed = [
+                address
+                for address in user_input.get("remove", [])
+                if coordinator.findmy_manager.remove_accessory(address)
+            ]
+            if removed:
+                # Drop the departed accessories from the alignment Store too, or
+                # their indices linger there indefinitely - nothing else triggers a
+                # save once an accessory stops being sighted.
+                await coordinator.async_save_findmy_alignment()
+            self.hass.config_entries.async_update_entry(
+                self.config_entry,
+                data={**self.config_entry.data, CONFDATA_FINDMY: coordinator.findmy_manager.dump()},
+            )
+            return await self.async_step_findmy()
+
+        return self.async_show_form(
+            step_id="findmy_remove",
+            data_schema=vol.Schema(
+                {
+                    vol.Optional("remove", default=[]): SelectSelector(
+                        SelectSelectorConfig(
+                            options=[
+                                SelectOptionDict(value=acc.address, label=acc.friendly_name)
+                                for acc in accessories.values()
+                            ],
+                            multiple=True,
+                        )
+                    )
+                }
+            ),
+        )
 
     async def _update_options(self):
         """Update config entry options."""

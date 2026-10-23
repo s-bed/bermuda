@@ -14,8 +14,19 @@ from homeassistant.core import callback
 from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.entity_registry import async_migrate_entries
+from homeassistant.helpers.storage import Store
 
-from .const import _LOGGER, DOMAIN, PLATFORMS, STARTUP_MESSAGE
+from .const import (
+    _LOGGER,
+    CONF_DEVICES,
+    DOMAIN,
+    FINDMY_STORAGE_KEY,
+    FINDMY_STORAGE_VERSION,
+    PLATFORMS,
+    STARTUP_MESSAGE,
+    TILE_STORAGE_KEY,
+    TILE_STORAGE_VERSION,
+)
 from .coordinator import BermudaDataUpdateCoordinator
 from .util import mac_math_offset, mac_norm
 
@@ -43,6 +54,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: BermudaConfigEntry) -> b
         _LOGGER.info(STARTUP_MESSAGE)
     coordinator = BermudaDataUpdateCoordinator(hass, entry)
     entry.runtime_data = BermudaData(coordinator)
+    # Tile metadevice bindings persist across restarts (see bermuda_tile.py).
+    await coordinator.tile_manager.async_load()
 
     async def on_failure():
         _LOGGER.debug("Coordinator last update failed, rasing ConfigEntryNotReady")
@@ -57,6 +70,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: BermudaConfigEntry) -> b
         await on_failure()
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    # One-shot migration: earlier versions let metadevices fall through to the
+    # generic device_info branch, which registered their id as a bluetooth
+    # connection. Runs here rather than in the update loop - it is a migration,
+    # not per-cycle work.
+    coordinator.async_purge_invalid_bluetooth_connections()
 
     entry.async_on_unload(entry.add_update_listener(async_reload_entry))
 
@@ -105,19 +124,39 @@ async def async_remove_config_entry_device(
     coordinator: BermudaDataUpdateCoordinator = config_entry.runtime_data.coordinator
     address = None
     for domain, ident in device_entry.identifiers:
-        try:
-            if domain == DOMAIN:
-                # the identifier should be the base device address, and
-                # may have "_range" or some other per-sensor suffix.
-                # The address might be a mac address, IRK or iBeacon uuid
-                address = ident.split("_")[0]
-        except KeyError:
-            pass
+        if domain == DOMAIN:
+            # The identifier is the device's unique_id: a MAC address, an IRK,
+            # or an iBeacon's uuid_major_minor - which has underscores of its
+            # own, so it must be matched whole, not split.
+            address = ident
     if address is not None:
-        try:
-            coordinator.devices[mac_norm(address)].create_sensor = False
-        except KeyError:
+        # Older versions added a per-sensor suffix ("_range") to the id. Strip
+        # trailing "_part"s one at a time until something matches, so an
+        # iBeacon's own underscores ("uuid_major_minor_range") survive.
+        device = None
+        candidate = address
+        while device is None:
+            device = coordinator.devices.get(mac_norm(candidate))
+            if "_" not in candidate:
+                break
+            candidate = candidate.rsplit("_", 1)[0]
+        if device is None:
             _LOGGER.warning("Failed to locate device entry for %s", address)
+            return True
+        device.create_sensor = False
+        # calculate_data() turns create_sensor back on every cycle for any
+        # address in CONF_DEVICES, so a removed device has to leave that list
+        # too, or its entities come straight back.
+        tracked = config_entry.options.get(CONF_DEVICES, [])
+        # Compared normalised: a stored address may use "-" or "_" separators.
+        target = mac_norm(device.address)
+        keep = [a for a in tracked if mac_norm(a) != target]
+        if len(keep) != len(tracked):
+            hass.config_entries.async_update_entry(config_entry, options={**config_entry.options, CONF_DEVICES: keep})
+            # The reload that follows is scheduled, not immediate: update the
+            # live options too (every BermudaDevice shares this dict), or a
+            # cycle in between turns create_sensor straight back on.
+            coordinator.options[CONF_DEVICES] = keep
         return True
     # Even if we don't know this address it probably just means it's stale or from
     # a previous version that used weirder names. Allow it.
@@ -130,11 +169,40 @@ async def async_remove_config_entry_device(
 
 async def async_unload_entry(hass: HomeAssistant, entry: BermudaConfigEntry) -> bool:
     """Handle removal of an entry."""
+    # Alignment is throttled, so a dirty value may have no pending write behind
+    # it. Flush before tearing down or a reload silently loses it.
+    coordinator = getattr(entry, "runtime_data", None)
+    if coordinator is not None:
+        await coordinator.coordinator.async_flush_findmy_alignment()
+        await coordinator.coordinator.async_shutdown_background_writers()
     if unload_result := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
         _LOGGER.debug("Unloaded platforms.")
     return unload_result
 
 
+async def async_remove_entry(hass: HomeAssistant, entry: BermudaConfigEntry) -> None:
+    """Delete the FindMy alignment and Tile binding stores when the integration is removed."""
+    await Store(hass, FINDMY_STORAGE_VERSION, FINDMY_STORAGE_KEY).async_remove()
+    # Left behind, old Tile bindings and IDs would come back on a fresh re-add.
+    await Store(hass, TILE_STORAGE_VERSION, TILE_STORAGE_KEY).async_remove()
+    _LOGGER.debug("Removed FindMy alignment and Tile binding stores.")
+
+
 async def async_reload_entry(hass: HomeAssistant, entry: BermudaConfigEntry) -> None:
-    """Reload config entry."""
+    """
+    Reload config entry - unless the change is already live in memory.
+
+    api.async_set_rssi_offsets applies new offsets to the running coordinator
+    and then persists them to the entry so they survive a restart. That
+    persist fires this listener; reloading would tear down and rebuild the
+    coordinator (dropping every advert history) for a change it is already
+    carrying, so when the entry's options are exactly what the coordinator
+    said it applied, there is nothing to do.
+    """
+    coordinator = getattr(getattr(entry, "runtime_data", None), "coordinator", None)
+    pending = getattr(coordinator, "inline_options", None)
+    if pending is not None and dict(entry.options) == pending:
+        coordinator.inline_options = None
+        _LOGGER.debug("Options change already applied in memory; skipping reload")
+        return
     hass.config_entries.async_schedule_reload(entry.entry_id)

@@ -11,8 +11,10 @@ from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import (
+    ADDR_TYPE_FINDMY,
     ADDR_TYPE_IBEACON,
     ADDR_TYPE_PRIVATE_BLE_DEVICE,
+    ADDR_TYPE_TILE,
     ATTRIBUTION,
     CONF_UPDATE_INTERVAL,
     DEFAULT_UPDATE_INTERVAL,
@@ -24,6 +26,36 @@ if TYPE_CHECKING:
     from . import BermudaConfigEntry
     from .coordinator import BermudaDataUpdateCoordinator
     # from . import BermudaDevice
+
+
+def published_shape(entity) -> tuple:
+    """
+    The parts of what async_write_ha_state publishes that can change between cycles.
+
+    Name, unit, device class and capability attributes are fixed for the life
+    of a Bermuda entity, so state, icon, availability and the extra attributes
+    are what decide whether a write would change anything.
+    """
+    attrs = entity.extra_state_attributes
+    return (entity.available, entity.state, entity.icon, dict(attrs) if attrs else None)
+
+
+def write_if_changed(entity) -> bool:
+    """
+    Write the entity's state only when it would differ from the last write.
+
+    Every Bermuda entity (about nine per tracked device) wrote its state on
+    every cycle. HA's state machine drops an identical write before the
+    recorder sees it, but only after building the full State (attributes,
+    unit conversion, registry lookups), so the cost was paid each second for
+    every entity whether or not anything had moved. Returns whether it wrote.
+    """
+    shape = published_shape(entity)
+    if shape == entity.bermuda_last_published:
+        return False
+    entity.bermuda_last_published = shape
+    entity.async_write_ha_state()
+    return True
 
 
 class BermudaEntity(CoordinatorEntity):
@@ -53,6 +85,7 @@ class BermudaEntity(CoordinatorEntity):
         self.bermuda_update_interval = config_entry.options.get(CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL)
         self.bermuda_last_state: Any = 0
         self.bermuda_last_stamp: float = 0
+        self.bermuda_last_published: tuple | None = None
 
     def _cached_ratelimit(self, statevalue: Any, fast_falling=True, fast_rising=False, interval=None):
         """
@@ -69,7 +102,7 @@ class BermudaEntity(CoordinatorEntity):
         nowstamp = monotonic_time_coarse()
         if (
             (self.bermuda_last_stamp < nowstamp - self.bermuda_update_interval)  # Cache is stale
-            or (self._device.ref_power_changed > nowstamp + 2)  # ref power changed in last 2sec
+            or (self._device.ref_power_changed > nowstamp - 2)  # ref power changed in last 2sec
             or (self.bermuda_last_state is None)  # Nothing compares to you.
             or (statevalue is None)  # or you.
             or (fast_falling and statevalue < self.bermuda_last_state)  # (like Distance)
@@ -98,7 +131,7 @@ class BermudaEntity(CoordinatorEntity):
             if self.device_entry:
                 # We have a new name locally, so let's update the device registry.
                 self.dr.async_update_device(self.device_entry.id, name=self._device.name)
-        self.async_write_ha_state()
+        write_if_changed(self)
 
     @property
     def unique_id(self):
@@ -135,6 +168,17 @@ class BermudaEntity(CoordinatorEntity):
             # this "matches" what it stores for identifier.
             connections = {("ibeacon", self._device.address.lower())}
             model = f"iBeacon: {self._device.address.lower()}"
+        elif self._device.address_type == ADDR_TYPE_TILE:
+            # A Tile metadevice: the address is our own tile_<hex> id, not a
+            # MAC (the tag rotates its real one), so namespace it like iBeacon.
+            connections = {("tile", self._device.address.lower())}
+            model = "Tile tracker"
+        elif self._device.address_type == ADDR_TYPE_FINDMY:
+            # A FindMy accessory has no stable MAC, so we can't offer a bluetooth
+            # connection tuple - the address here is our own metadevice id. Use a
+            # namespaced identifier instead, the way iBeacon does.
+            connections = {("findmy", self._device.address.lower())}
+            model = "FindMy accessory"
         elif self._device.address_type == ADDR_TYPE_PRIVATE_BLE_DEVICE:
             # Private BLE Device integration doesn't specify "connection" tuples,
             # so we use what it defines for the "identifier" instead.
@@ -191,23 +235,28 @@ class BermudaGlobalEntity(CoordinatorEntity):
         self._cache_ratelimit_value = None
         self._cache_ratelimit_stamp: float = 0
         self._cache_ratelimit_interval = 60
+        self.bermuda_last_published: tuple | None = None
 
     @callback
     def _handle_coordinator_update(self) -> None:
-        """
-        Handle updated data from the co-ordinator.
-
-        (we don't need to implement this, but if we want to do anything special we can)
-        """
-        self.async_write_ha_state()
+        """Handle updated data from the co-ordinator: publish only a change."""
+        write_if_changed(self)
 
     def _cached_ratelimit(self, statevalue: Any, interval: int | None = None):
-        """A simple way to rate-limit sensor updates."""
+        """
+        A simple way to rate-limit sensor updates.
+
+        ``statevalue`` may be a callable, which is only called when the cache
+        is stale: a count that walks every device is then taken once an
+        interval instead of every cycle, only to be thrown away.
+        """
         if interval is not None:
             self._cache_ratelimit_interval = interval
         nowstamp = monotonic_time_coarse()
 
         if nowstamp > self._cache_ratelimit_stamp + self._cache_ratelimit_interval:
+            if callable(statevalue):
+                statevalue = statevalue()
             self._cache_ratelimit_stamp = nowstamp
             self._cache_ratelimit_value = statevalue
             return statevalue
