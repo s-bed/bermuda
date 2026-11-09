@@ -10,7 +10,7 @@ on:
       - fork-testing
   pull_request:
   schedule:
-    - cron: "0 0 * * *"
+    - cron: "0 0 * * 1"
 
 env:
   DEFAULT_PYTHON: 3.14
@@ -66,7 +66,7 @@ jobs:
         uses: "hacs/action@d556e736723344f83838d08488c983a15381059a" # 22.5.0
         with:
           category: "integration"
-          ignore: brands
+          ignore: brands issues topics
 
   hassfest:
     runs-on: "ubuntu-latest"
